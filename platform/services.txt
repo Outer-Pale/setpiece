@@ -2,3 +2,5 @@
 # One name per line. Each build step 1 issue appends the containers it adds.
 postgres
 openfga
+kong
+edge-auth
