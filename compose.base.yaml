@@ -34,6 +34,8 @@ services:
       KONG_SSL_CERT_KEY: /run/secrets/kong-tls.key
       KONG_UNTRUSTED_LUA: sandbox
       KONG_UNTRUSTED_LUA_SANDBOX_REQUIRES: resty.http
+      # Two workers, not one per core: the host is shared (spec §4 stop rule; 20 workers used 1.2 GB).
+      KONG_NGINX_WORKER_PROCESSES: "2"
     # The only port published to the outside (§4.12). SETPIECE_PUBLISH_ADDRESS (in .env) narrows
     # it to one host address where another process already holds 443 on another address
     # (spec open question 4; on harry-msi-server tailscaled holds it on the tailnet address).

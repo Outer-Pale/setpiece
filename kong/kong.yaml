@@ -79,3 +79,12 @@ services:
           - name: rate-limiting
             config: { minute: 3, policy: local, limit_by: ip }
           - *post
+
+# Global, so it runs in the rewrite phase, before Kong works out the upstream X-Forwarded-For
+# from the client's header (runloop access.before). Route plugins run too late for that, and
+# Kong would append the real address to a forged value (spec K-1 (d)).
+plugins:
+  - name: pre-function
+    config:
+      rewrite:
+        - kong.service.request.clear_header("x-forwarded-for")
