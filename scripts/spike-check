@@ -2,7 +2,7 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg kafka k3 k4 k5 telemetry static net
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg kafka k3 k4 k5 telemetry static net up-twice stats
 #        scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>   (K-1 (b), off the host)
 # Sections that need the running stack use the Compose project in COMPOSE_PROJECT_NAME, if set.
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
@@ -822,6 +822,78 @@ section_net() {
     [ "$internal" = "$want_int" ] || bad+=" $net:${internal:-missing}"
   done
   check J-1 "the five networks exist; idp and data are internal, the others not (offenders:${bad:- none})" test -z "$bad"
+}
+
+# A-1's object listings, one labelled block each, sorted so two runs compare as text.
+objects_listing() {
+  echo "## databases"; psql_su "select datname from pg_database order by 1"
+  echo "## roles"; psql_su "select rolname from pg_roles where rolname !~ '^pg_' order by 1"
+  echo "## topics"; kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --list 2> /dev/null | sort
+  echo "## kafka users"; kafka_sh kafka-configs.sh --command-config /tmp/kafka/admin.properties \
+    --describe --entity-type users 2> /dev/null | sed -E "s/^SCRAM credential configs for user-principal '([^']+)'.*/\1/" | sort
+  echo "## acls"; kafka_sh kafka-acls.sh --command-config /tmp/kafka/admin.properties --list 2> /dev/null |
+    sed -nE 's/.*resourceType=([A-Z]+), name=([^,]+), patternType=([A-Z]+)\).*/\1 \3 \2/p; s/.*\(principal=([^,]+), host=([^,]+), operation=([A-Z_]+), permissionType=([A-Z]+)\).*/  \1 \3 \4/p' |
+    awk '/^[A-Z]/ { r = $0; next } { print r $0 }' | sort
+  echo "## connectors"; connect_api GET /connectors 2> /dev/null | jq -c 'sort'
+  echo "## keycloak"
+  # The admin password goes through KC_CLI_PASSWORD inside the container, never a command line.
+  dc exec -T keycloak bash -c '
+    c=$(mktemp); kc=/opt/keycloak/bin/kcadm.sh
+    KC_CLI_PASSWORD=$(< /run/secrets/keycloak-admin) "$kc" config credentials --config "$c" \
+      --server http://127.0.0.1:8080 --realm master --user admin > /dev/null 2>&1 || { echo "kcadm sign-in failed"; exit 1; }
+    "$kc" get realms --config "$c" --fields realm; "$kc" get organizations -r setpiece --config "$c" --fields alias
+    "$kc" get users -r setpiece --config "$c" --fields username; rc=$?; rm -f "$c"; exit $rc' 2> /dev/null |
+    jq -r '.[] | if .realm then "realm \(.realm)" elif .alias then "organization \(.alias)" else "user \(.username)" end' | sort
+}
+# Base container ids by name, and the names of long-running base containers that aren't healthy.
+base_ids() { docker compose -f "$repo/compose.base.yaml" ps -a --format '{{.Name}} {{.ID}}' | sort; }
+unhealthy() {
+  local svc c v
+  for svc in $(expected "$repo/platform/services.txt"); do
+    c=$(dc ps -q "$svc" | head -1)
+    v=$( [ -n "$c" ] && docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$c")
+    [ "$v" = healthy ] || echo "$svc:${v:-missing}"
+  done | tr '\n' ' '
+}
+
+# A-1: scripts/up, then again. Both times every long-running container is healthy; the second run
+# recreates nothing, and no database, role, topic, user, ACL, connector or realm object changes.
+section_up_twice() {
+  local d i1 i2 o1 o2 u run empty dups
+  d=$(mktemp -d)
+  for run in 1 2; do
+    if ! (cd "$repo" && scripts/up) > "$d/up$run.log" 2>&1; then
+      fail A-1 "scripts/up run $run failed: $(tail -3 "$d/up$run.log" | tr '\n' ' ')"; rm -rf "$d"; return
+    fi
+    u=$(unhealthy)
+    check A-1 "after scripts/up run $run every long-running container is healthy (not healthy: ${u:-none})" test -z "$u"
+    base_ids > "$d/ids$run"
+    objects_listing > "$d/obj$run"
+  done
+  i1=$(wc -l < "$d/ids1"); o1=$(grep -c . "$d/obj1"); i2=$(diff "$d/ids1" "$d/ids2" | grep -c '^[<>]'); o2=$(diff "$d/obj1" "$d/obj2" | grep '^[<>]' | head -5 | tr '\n' ' ')
+  check A-1 "the second run recreated none of the $i1 base containers ($i2 id lines differ)" test "$i1" -gt 0 -a "$i2" -eq 0
+  # Every listing but connectors (none in the base stack) must have read something.
+  empty=$(awk '/^## / { if (b != "" && b != "connectors" && n == 0) print b; b = substr($0, 4); n = 0; next }
+    $0 != "" && $0 != "[]" { n++ } END { if (b != "connectors" && n == 0) print b }' "$d/obj2" | tr '\n' ',')
+  dups=$(awk '/^## / { b = $0; next } { print b "\t" $0 }' "$d/obj2" | sort | uniq -d | tr '\n' ' ')
+  check A-1 "no object changed or doubled across the second run ($o1 listing lines; empty listings: ${empty:-none}; doubled: ${dups:-none}; diff: ${o2:-none})" \
+    test -z "$empty" -a -z "$o2" -a -z "$dups"
+  echo "        objects after run 2:"; awk '{ print "          " $0 }' "$d/obj2"
+  rm -rf "$d"
+}
+
+# A-6: memory. docker stats for every running container of the project, with the host's free -m
+# now and, when `all` recorded it, before bring-up.
+section_stats() {
+  local out n ids
+  [ -n "${free_before:-}" ] && { echo "        free -m before bring-up:"; awk '{ print "          " $0 }' <<< "$free_before"; }
+  echo "        free -m now:"; free -m | sed 's/^/          /'
+  mapfile -t ids < <(dc ps -q)
+  n=${#ids[@]}
+  out=$( [ "$n" -gt 0 ] && docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}' "${ids[@]}" 2>&1)
+  awk '{ print "        " $0 }' <<< "$out"
+  check A-6 "docker stats recorded for all $n running containers of the project" \
+    test "$n" -gt 0 -a "$(grep -c 'iB' <<< "$out")" -eq "$n"
 }
 
 section_telemetry() {
