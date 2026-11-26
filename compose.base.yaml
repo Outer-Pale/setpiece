@@ -17,7 +17,158 @@ networks:
   # The Collectors, Kong's status listener and otel-lgtm.
   ops: {}
 
+x-postgres-image: &postgres-image postgres:18@sha256:c699303802144847d238196173655dbbecf7a96aeca1565f2b02eb671a1f0b6b
+x-openfga-image: &openfga-image openfga/openfga:v1.23.0@sha256:2a1b4ef95f2f27e6d420f11cf14390b4f537e699de8d18b6a07d8b355e11cf02
+
 services:
+  # §4.3. The slot settings are fixed constants here; the generator fails if services need more.
+  postgres:
+    image: *postgres-image
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=16
+      - -c
+      - max_wal_senders=16
+      - -c
+      - max_slot_wal_keep_size=10GB
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres-superuser
+    secrets: [postgres-superuser]
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./pg/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      # The directory, not a file, so generated lines work on a running server (§4.3).
+      - ./pg/hba.d:/etc/postgresql/hba.d:ro
+    networks: [services, data, idp]
+    cap_drop: [ALL]
+    # The entrypoint chowns the data directory and drops to the postgres user (§4.12b).
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # One-shot: the Keycloak, OpenFGA and monitor databases and roles (§4.3). Runs on every scripts/up.
+  pg-init:
+    image: *postgres-image
+    entrypoint: ["/pg/init.sh"]
+    user: postgres
+    secrets: [postgres-superuser, keycloak-db, openfga-db, monitor-db]
+    volumes:
+      - ./pg/init.sh:/pg/init.sh:ro
+      - ./pg/init.base.sql:/pg/init.base.sql:ro
+    tmpfs: [/tmp]
+    networks: [services]
+    cap_drop: [ALL]
+    # No capabilities: it only runs psql as the postgres user.
+    cap_add: []
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # One-shot: OpenFGA's schema. Reads the datastore URI from the rendered config (§4.12b, R7-R M4).
+  openfga-migrate:
+    image: *openfga-image
+    command: [migrate]
+    secrets:
+      - source: openfga-config
+        target: /etc/openfga/config.yaml
+    networks: [services]
+    cap_drop: [ALL]
+    # No capabilities: a non-root (65532) Go binary.
+    cap_add: []
+    depends_on:
+      pg-init:
+        condition: service_completed_successfully
+
+  openfga:
+    image: *openfga-image
+    command: [run]
+    # The datastore URI and the preshared key come from this file, never the environment (B-5).
+    secrets:
+      - source: openfga-config
+        target: /etc/openfga/config.yaml
+    networks: [services]
+    cap_drop: [ALL]
+    # No capabilities: a non-root (65532) Go binary on unprivileged ports.
+    cap_add: []
+    restart: unless-stopped
+    healthcheck:
+      # Exec form: the image is distroless and ships this probe (§4.7).
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=127.0.0.1:8081"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+
+  # Kong 3.9 open source, DB-less from the hand-written kong/kong.yaml (spec F-1; R-0 option A).
+  kong:
+    image: kong:3.9.5@sha256:e9b87ddd0e6087792586e2cbba5ce91eadcbdd3d3673249aa4606f7207408c0d
+    restart: unless-stopped
+    user: kong
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yaml
+      KONG_ADMIN_LISTEN: "off"
+      KONG_ADMIN_GUI_LISTEN: "off"
+      KONG_STATUS_LISTEN: "off"
+      KONG_PROXY_LISTEN: "0.0.0.0:8443 ssl"
+      KONG_SSL_CERT: /run/secrets/kong-tls.crt
+      KONG_SSL_CERT_KEY: /run/secrets/kong-tls.key
+      KONG_UNTRUSTED_LUA: sandbox
+      KONG_UNTRUSTED_LUA_SANDBOX_REQUIRES: resty.http
+      # Two workers, not one per core: the host is shared (spec §4 stop rule; 20 workers used 1.2 GB).
+      KONG_NGINX_WORKER_PROCESSES: "2"
+    # The only port published to the outside (§4.12). SETPIECE_PUBLISH_ADDRESS (in .env) narrows
+    # it to one host address where another process already holds 443 on another address
+    # (spec open question 4; on harry-msi-server tailscaled holds it on the tailnet address).
+    ports:
+      - "${SETPIECE_PUBLISH_ADDRESS:-0.0.0.0}:443:8443"
+    secrets: [kong-tls.crt, kong-tls.key]
+    volumes:
+      - ./kong/kong.yaml:/kong/kong.yaml:ro
+    # cap_add: none. Kong listens on 8443 inside the container, so it needs no NET_BIND_SERVICE.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks: [edge, services]
+
+  # A stub edge-auth in plain Node, run as a mounted script (spec F-2). Not the real service.
+  edge-auth:
+    image: node:26@sha256:f8e5d4bb28fa55c74f1345166a082a10b7c68f22304350c1ce0d18358ae94996
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    command: ["node", "/app/stub.mjs"]
+    volumes:
+      - ./edge-auth/stub.mjs:/app/stub.mjs:ro
+    # cap_add: none. It listens on 8080 as an unprivileged user.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    networks: [services, idp]
+
   # Keycloak (M0014), on its own database from pg-init (spec C-2, E-1). On `idp` only (§4.12;
   # punch list P-6). Its passwords come from mounted files through keycloak/start.sh (B-5, B-6).
   keycloak:
@@ -62,8 +213,24 @@ services:
       retries: 3
       start_period: 180s
 
+volumes:
+  postgres-data: {}
+
+# Each container mounts only the files it declares (§4.12b). scripts/secrets-init writes them.
 secrets:
+  postgres-superuser:
+    file: ./secrets/postgres-superuser
   keycloak-db:
     file: ./secrets/keycloak-db
   keycloak-admin:
     file: ./secrets/keycloak-admin
+  openfga-db:
+    file: ./secrets/openfga-db
+  monitor-db:
+    file: ./secrets/monitor-db
+  openfga-config:
+    file: ./secrets/openfga-config
+  kong-tls.crt:
+    file: ./secrets/kong-tls.crt
+  kong-tls.key:
+    file: ./secrets/kong-tls.key

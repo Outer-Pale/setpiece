@@ -2,9 +2,12 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k4
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 pg k4
+#        scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>   (K-1 (b), off the host)
+# Sections that need the running stack use the Compose project in COMPOSE_PROJECT_NAME, if set.
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
-# shellcheck disable=SC2329
+# jq programs are single-quoted on purpose (SC2016).
+# shellcheck disable=SC2329,SC2016
 set -uo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 failed=0
@@ -30,7 +33,7 @@ entries() { sed -E 's/#.*//' "$repo/platform/secrets.base.yaml" | grep -E ':' | 
 files_of() { entries | awk -F: -v k="$1" '$2 == k { print $1 }'; }
 
 section_secrets() {
-  local d h1 h2 f bad
+  local d h1 h2 f bad fga
   d=$(sandbox)
   "$d/scripts/secrets-init" "$d"
   h1=$(cd "$d/secrets" && sha256sum ./* | sort)
@@ -40,6 +43,7 @@ section_secrets() {
   bad=""
   for f in $(files_of password) $(files_of pem-key); do [ -f "$d/secrets/$f" ] || bad+=" $f"; done
   for f in $(files_of certificate); do [ -f "$d/secrets/$f.crt" ] && [ -f "$d/secrets/$f.key" ] || bad+=" $f"; done
+  for f in $(files_of config); do [ -f "$d/secrets/$f" ] || bad+=" $f"; done
   check B-1 "every base secret written (missing:${bad:- none})" test -z "$bad"
   check B-1 "second run changes no file" test "$h1" = "$h2"
   check B-1 "generated/fga.env exists and is empty" test -f "$d/generated/fga.env" -a ! -s "$d/generated/fga.env"
@@ -60,6 +64,11 @@ section_secrets() {
   done
   check B-2 "pem-key files are Ed25519 PKCS#8 (offenders:${bad:- none})" test -z "$bad"
 
+  fga=$d/secrets/openfga-config
+  check B-5 "openfga-config holds the openfga-db password and the preshared key" bash -c \
+    "grep -qF \"//openfga:\$(cat '$d/secrets/openfga-db')@postgres:5432/openfga?\" '$fga' &&
+     grep -qxF \"      - \$(cat '$d/secrets/openfga-preshared-key')\" '$fga'"
+
   for f in $(files_of certificate); do
     check B-3 "$f.crt subject: $(openssl x509 -in "$d/secrets/$f.crt" -noout -subject 2> /dev/null)" \
       bash -c "openssl x509 -in '$d/secrets/$f.crt' -noout -subject | grep -q self-signed"
@@ -73,7 +82,7 @@ section_secrets() {
   rm -rf "$d"
 }
 
-# A fake `docker` that records its arguments. FAKE_VERSION and FAKE_SERVICES set its answers.
+# A fake `docker` that records its arguments. FAKE_VERSION sets its answer to `version`.
 fake_docker() {
   local bin=$1
   mkdir -p "$bin"
@@ -83,7 +92,6 @@ if [ -e secrets/kafka-admin ]; then sec=y; else sec=n; fi
 echo "docker $* [secrets=$sec]" >> "$FAKE_LOG"
 case " $* " in
   *" version --short "*) echo "$FAKE_VERSION" ;;
-  *" config --services "*) printf '%s\n' $FAKE_SERVICES ;;
 esac
 EOF
   chmod +x "$bin/docker"
@@ -93,12 +101,12 @@ section_up_version() {
   local d rc
   d=$(sandbox)
   fake_docker "$d/bin"
-  FAKE_LOG="$d/log" FAKE_VERSION=9.9.9 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
+  FAKE_LOG="$d/log" FAKE_VERSION=9.9.9 PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
   rc=$?
   check A-5 "refuses Compose 9.9.9 (exit $rc: $(cat "$d/err"))" test "$rc" -ne 0
   check A-5 "nothing started: no secrets written, no up call" \
     bash -c "[ ! -e '$d/secrets' ] && ! grep -q ' up ' '$d/log'"
-  FAKE_LOG="$d/log2" FAKE_VERSION=v5.5.1 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
+  FAKE_LOG="$d/log2" FAKE_VERSION=v5.5.1 PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
   rc=$?
   check A-5 "accepts the pinned version (exit $rc)" test "$rc" -eq 0 -a -f "$d/secrets/kafka-admin"
   rm -rf "$d"
@@ -108,17 +116,17 @@ section_up_order() {
   local d log
   d=$(sandbox)
   fake_docker "$d/bin"
-  # Nothing generated, no services yet: only the version and config calls, no up, no fga-init.
-  FAKE_LOG="$d/log" FAKE_VERSION=5.5.1 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up"
+  # Nothing generated and an empty services list: step 2 only, no fga-init, no step 3.
+  : > "$d/platform/services.txt"
+  FAKE_LOG="$d/log" FAKE_VERSION=5.5.1 PATH="$d/bin:$PATH" "$d/scripts/up"
   log=$(cat "$d/log")
   check A-2 "no compose.services.yaml: only compose.base.yaml is named" bash -c "! grep -q compose.services.yaml <<< '$log'"
   check A-2 "no fga/fga.mod: fga-init not run" bash -c "! grep -q fga-init <<< '$log'"
-  check A-3 "empty services list and no postgres/openfga: no up call" bash -c "! grep -q ' up ' <<< '$log'"
+  check A-3 "empty services list: one up call, step 2's" bash -c "[ \"\$(grep -c ' up ' <<< '$log')\" = 1 ]"
 
   # With a stand-in list: step 2 names only postgres and openfga, step 3 names the list, in that order.
   printf 'kong\nedge-auth\n' > "$d/platform/services.txt"
-  FAKE_LOG="$d/log2" FAKE_VERSION=5.5.1 FAKE_SERVICES="postgres openfga pg-init kong edge-auth" \
-    PATH="$d/bin:$PATH" "$d/scripts/up"
+  FAKE_LOG="$d/log2" FAKE_VERSION=5.5.1 PATH="$d/bin:$PATH" "$d/scripts/up"
   log=$(grep ' up ' "$d/log2" | sed 's/ \[secrets=.\]$//')
   local first_up
   first_up=$(grep -m1 ' up ' "$d/log2")
@@ -141,18 +149,229 @@ section_static_config() {
   check K-6d "static compose checks (digests, cap_drop, restart, health check, no literal secrets)" test "$rc" -eq 0
 }
 
-# jq as a test: exit status only.
-jqt() { jq -e "$@" > /dev/null; }
+# Compose with the test overlay. COMPOSE_PROJECT_NAME, when set, picks the project.
+dc() { docker compose -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml" "$@"; }
+# A jq test over a file of JSON values, quiet.
+jqt() { jq -se "$1" "$2" > /dev/null; }
+# What the stub edge-auth recorded, read from a probe on `services`.
+stub_received() { dc run --rm --no-deps -T probe curl -s http://edge-auth:8080/_stub/received 2> /dev/null; }
+# Waits for the start of a new minute, so a rate-limit window is fresh and can't roll over mid-test.
+fresh_minute() { sleep $((61 - 10#$(date +%S))); }
+
+section_k1() {
+  local d run addr url kong img code out rec ok limited n i
+  d=$(mktemp -d)
+  if ! (cd "$repo" && scripts/up) > "$d/up.log" 2>&1 || ! dc up -d --wait echo > "$d/echo.log" 2>&1; then
+    fail K-1 "stack did not start: $(tail -3 "$d/up.log" "$d/echo.log" | tr '\n' ' ')"
+    rm -rf "$d"; return
+  fi
+  addr=$(dc port kong 8443 | grep -v '^\[' | head -1)
+  addr=${addr/0.0.0.0/127.0.0.1}
+  url="https://$addr"
+  kong=$(dc ps -q kong)
+  img=$(dc --profile probe config --format json | jq -r '.services.probe.image')
+  run="k1-$(date +%s)-$$"
+
+  # F-1: Kong answers on 443, publishes nothing else, and has no admin API.
+  code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/")
+  check F-1 "Kong answers on $url (HTTP $code)" test "$code" != 000
+  out=$(docker inspect -f '{{json .NetworkSettings.Ports}}' "$kong" |
+    jq -r '[to_entries[] | select(.value != null) | "\(.key)->\(.value[].HostPort)"] | unique | join(" ")')
+  check F-1 "published ports: $out" test "$out" = "8443/tcp->443"
+  # From inside Kong's network namespace: the proxy port answers, the admin ports refuse (curl exit 7).
+  inside() { docker run --rm --network "container:$kong" --user 65532 --cap-drop ALL "$img" \
+    curl -sk -m 3 -o /dev/null -w '%{http_code}' "$1" 2> /dev/null; }
+  code=$(inside https://127.0.0.1:8443/)
+  check F-1 "probe inside Kong reaches the proxy port 8443 (HTTP ${code:-none})" test "${code:-000}" != 000
+  for i in http://127.0.0.1:8001/ https://127.0.0.1:8444/; do
+    inside "$i" > /dev/null; code=$?
+    check F-1 "nothing listens on admin $i inside Kong (curl exit $code, 7 is refused)" test "$code" -eq 7
+  done
+
+  # B-5 for Kong: the key is a mounted file, and Kong serves the certificate from ./secrets.
+  check B-5 "Kong's certificate key is mounted at /run/secrets/kong-tls.key" \
+    bash -c "docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' '$kong' | grep -qw /run/secrets/kong-tls.key"
+  out=$(openssl s_client -connect "$addr" -servername localhost < /dev/null 2> /dev/null | openssl x509 -noout -fingerprint -sha256 2> /dev/null)
+  check B-5 "Kong serves secrets/kong-tls.crt (${out:-no certificate})" \
+    test -n "$out" -a "$out" = "$(openssl x509 -in "$repo/secrets/kong-tls.crt" -noout -fingerprint -sha256)"
+
+  # K-1 (a), (c), (d): a request carrying everything a client must not pass on.
+  out=$(curl -sk "$url/spike/k1" -H "Authorization: Bearer good-$run-d" -H 'Cookie: session=client' \
+    -H 'x-chassis-internal-token: forged' -H 'x-chassis-correlation-id: forged' -H 'x-chassis-budget-ms: 99999' \
+    -H 'X-Forwarded-User: mallory' -H 'X-Remote-User: mallory' -H 'X-Forwarded-For: 203.0.113.66')
+  rec=$(stub_received | jq -c --arg a "Bearer good-$run-d" '[.[] | select(.body.authorization == $a)] | last')
+  printf '%s\n%s\n' "$out" "${rec:-null}" > "$d/d.json"
+  echo "        upstream saw: $(jq -c '.headers' <<< "$out" 2> /dev/null || echo "$out")"
+  check K-1 "(a) the client's Authorization reached edge-auth through kong.ctx.shared" \
+    jqt '.[1] != null' "$d/d.json"
+  check K-1 "(c) edge-auth got exactly { authorization, route, method, path } ($(jq -c .body <<< "${rec:-null}"))" \
+    jqt '.[1].body | (keys == ["authorization","method","path","route"]) and .route == "spike-k1"
+      and .method == "GET" and .path == "/spike/k1"' "$d/d.json"
+  check K-1 "(d) upstream got Bearer <x-chassis-internal-token>, the stub's correlation id and budget" \
+    jqt '.[0].headers as $h | .[1].issued as $i
+      | $h.authorization == "Bearer \($i["x-chassis-internal-token"])"
+      and $h["x-chassis-correlation-id"] == $i["x-chassis-correlation-id"]
+      and $h["x-chassis-budget-ms"] == $i["x-chassis-budget-ms"]' "$d/d.json"
+  check K-1 "(a)(d) no Cookie, X-Forwarded-User, X-Remote-User or client x-chassis-* reached the upstream" \
+    jqt '.[0].headers | (has("cookie") or has("x-forwarded-user") or has("x-remote-user")
+      or .["x-chassis-internal-token"] == "forged" or .["x-chassis-correlation-id"] == "forged") | not' "$d/d.json"
+  check K-1 "(d) X-Forwarded-For holds only the address Kong sees ($(jq -r '.headers | "\(.["x-forwarded-for"]) / X-Real-IP \(.["x-real-ip"])"' <<< "$out" 2> /dev/null))" \
+    jqt '.[0].headers | .["x-forwarded-for"] == .["x-real-ip"] and (.["x-real-ip"] | length > 0)' "$d/d.json"
+
+  # K-1 (d): a token edge-auth refuses gives the client its status and Problem body.
+  code=$(curl -sk -o "$d/b" -w '%{http_code} %{content_type}' "$url/spike/k1" -H "Authorization: Bearer nope-$run")
+  check K-1 "(d) refused token: client gets the stub's 401 Problem ($code)" \
+    bash -c "[ '$code' = '401 application/problem+json' ] && jq -e '.status == 401' '$d/b' > /dev/null"
+  # K-1 (c): the stub waits 3 s; Kong's 2 s timeout turns the failed call into 503.
+  code=$(curl -sk -o /dev/null -w '%{http_code} %{time_total}' "$url/spike/k1" -H "Authorization: Bearer slow-$run")
+  check K-1 "(c) edge-auth slower than 2 s gives 503 (status and seconds: $code)" \
+    bash -c "set -- $code; [ \"\$1\" = 503 ] && awk -v t=\"\$2\" 'BEGIN { exit !(t >= 1.9 && t < 3) }'"
+
+  # K-1 (e), and the forged-header part of (b) from the host: the limited route allows 3 a minute.
+  echo "        waiting for a fresh rate-limit minute"
+  fresh_minute
+  ok=0 limited=0
+  for i in 1 2 3 4 5 6; do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-$run-e")
+    case $code in 200) ok=$((ok + 1)) ;; 429) limited=$((limited + 1)) ;; esac
+  done
+  code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-$run-b" \
+    -H 'X-Forwarded-For: 198.51.100.7')
+  n=$(stub_received | jq --arg a "Bearer good-$run-e" '[.[] | select(.body.authorization == $a)] | length')
+  check K-1 "(e) 3 a minute: $ok got 200 and edge-auth saw ${n:-?}; $limited got 429 and never reached it" \
+    test "$ok" -eq 3 -a "$limited" -eq 3 -a "${n:--1}" -eq 3
+  check K-1 "(b) from the host: a forged X-Forwarded-For stays in the same bucket (got $code)" test "$code" = 429
+  notrun K-1 "(b) real LAN addresses and separate buckets: needs two off-host sources (k1 --from, spec open question 5)"
+  rm -rf "$d"
+}
+
+# K-1 (b) from a device off the host. Prints the address Kong sees for this device, and checks
+# that a forged X-Forwarded-For does not move it to a fresh bucket.
+section_k1_from() {
+  local label=$1 url="https://$2" mine=$3 seen code i limited=0
+  seen=$(curl -sk "$url/spike/k1" -H "Authorization: Bearer good-from-$label" | jq -r '.headers["x-real-ip"] // empty')
+  check K-1 "(b) $label: Kong sees ${seen:-nothing}, this device's LAN address is $mine" test "$seen" = "$mine"
+  echo "        waiting for a fresh rate-limit minute"
+  fresh_minute
+  for i in 1 2 3 4 5; do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-from-$label" \
+      -H "X-Forwarded-For: 198.51.100.$i")
+    [ "$code" = 429 ] && limited=$((limited + 1))
+  done
+  check K-1 "(b) $label: forged X-Forwarded-For values share one bucket ($limited of 5 got 429)" test "$limited" -gt 0
+  notrun K-1 "(b) separate buckets: run this on a second device within the same minute; it should get 200s"
+}
+
+psql_su() { dc exec -T -u postgres postgres psql -X -At -v ON_ERROR_STOP=1 -d postgres -c "$1"; }
+cid() { dc ps -a -q "$1"; }
+# Databases with owner and ACL, and roles with login and memberships: what a repeat must not change.
+pg_objects() {
+  psql_su "select 'db ' || datname || ' ' || pg_get_userbyid(datdba) || ' ' || coalesce(datacl::text, '')
+           from pg_database order by datname"
+  psql_su "select 'role ' || r.rolname || ' ' || r.rolcanlogin || ' ' || coalesce((select string_agg(b.rolname, ','
+             order by b.rolname) from pg_auth_members m join pg_roles b on b.oid = m.roleid where m.member = r.oid), '')
+           from pg_roles r where r.rolname !~ '^pg_' order by r.rolname"
+}
+
+section_pg() {
+  local s v db before after rc rules last mounts cfg
+  # C-1: the slot settings, as fixed constants.
+  for s in wal_level=logical max_replication_slots=16 max_wal_senders=16 max_slot_wal_keep_size=10GB; do
+    v=$(psql_su "show ${s%%=*}")
+    check C-1 "${s%%=*} = $v" test "$v" = "${s#*=}"
+  done
+
+  # C-2: databases, roles, pg_monitor, CONNECT revoked from PUBLIC, and a repeat changes nothing.
+  check C-2 "pg-init exited 0 on this bring-up" \
+    test "$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$(cid pg-init)")" = "exited 0"
+  for db in keycloak openfga monitor; do
+    v=$(psql_su "select pg_get_userbyid(datdba) from pg_database where datname = '$db'")
+    check C-2 "database $db exists, owned by '$v'" test "$v" = "$db"
+  done
+  v=$(psql_su "select pg_has_role('monitor', 'pg_monitor', 'member')")
+  check C-2 "monitor is in pg_monitor ($v)" test "$v" = t
+  for db in postgres keycloak openfga; do
+    v=$(psql_su "select has_database_privilege('public', '$db', 'connect')")
+    check C-2 "PUBLIC cannot connect to $db ($v)" test "$v" = f
+  done
+  # Each role signs in to its own database with the password from its secret file, and not to another.
+  # shellcheck disable=SC2016 # expanded inside the container
+  v=$(dc run --rm --no-deps -T --entrypoint sh pg-init -c '
+    umask 077
+    for r in keycloak openfga monitor; do
+      printf "postgres:5432:*:%s:%s\n" "$r" "$(cat /run/secrets/$r-db)" > /tmp/pgpass
+      PGPASSFILE=/tmp/pgpass psql -X -At -h postgres -U "$r" -d "$r" -c "select current_user" 2>&1
+    done
+    printf "postgres:5432:*:keycloak:%s\n" "$(cat /run/secrets/keycloak-db)" > /tmp/pgpass
+    PGPASSFILE=/tmp/pgpass psql -X -At -h postgres -U keycloak -d openfga -c "select 1" > /dev/null 2>&1 &&
+      echo keycloak-reached-openfga || echo keycloak-refused-openfga' 2> /dev/null)
+  echo "        $(tr '\n' ' ' <<< "$v")"
+  check C-2 "keycloak, openfga and monitor sign in with their secret-file passwords" \
+    test "$(head -3 <<< "$v" | tr '\n' ' ')" = "keycloak openfga monitor "
+  check C-3 "keycloak cannot sign in to the openfga database" grep -qx keycloak-refused-openfga <<< "$v"
+
+  before=$(pg_objects)
+  dc run --rm --no-deps -T pg-init 2>&1 | grep -v ' Container ' | sed 's/^/        /'
+  rc=${PIPESTATUS[0]}
+  after=$(pg_objects)
+  check C-2 "a second pg-init exits 0 ($rc)" test "$rc" -eq 0
+  check C-2 "a second pg-init changes no database or role" test "$before" = "$after"
+  cfg=$(dc config --format json)
+  v=$(jq -r '.services["openfga-migrate"].depends_on["pg-init"].condition // "none"' <<< "$cfg")
+  check C-2 "openfga-migrate depends on pg-init ($v)" test "$v" = service_completed_successfully
+  if jq -e '.services.keycloak' <<< "$cfg" > /dev/null; then
+    v=$(jq -r '.services.keycloak.depends_on["pg-init"].condition // "none"' <<< "$cfg")
+    check C-2 "keycloak depends on pg-init ($v)" test "$v" = service_completed_successfully
+  else
+    notrun C-2 "keycloak depends on pg-init: no keycloak yet (OUT-151)"
+  fi
+
+  # C-3: the allowlist as the server loaded it, include_dir last, and hba.d mounted as a directory.
+  check C-3 "hba_file is the mounted base file" test "$(psql_su 'show hba_file')" = /etc/postgresql/pg_hba.conf
+  rules=$(psql_su "select type || ' ' || array_to_string(database, ',') || ' ' || array_to_string(user_name, ',')
+                   || ' ' || coalesce(address, '-') || ' ' || auth_method from pg_hba_file_rules
+                   where error is null order by rule_number")
+  printf '%s\n' "$rules" | sed 's/^/        /'
+  check C-3 "no pg_hba error" test "$(psql_su 'select count(*) from pg_hba_file_rules where error is not null')" = 0
+  for s in "host all postgres samenet scram-sha-256" "host keycloak keycloak samenet scram-sha-256" \
+    "host openfga openfga samenet scram-sha-256" "host monitor monitor samenet scram-sha-256"; do
+    check C-3 "rule: $s" grep -qxF "$s" <<< "$rules"
+  done
+  check C-3 "no replication rule for all users" bash -c "! grep -Eq '^host[a-z]* ([^ ]*,)?replication(,[^ ]*)? ([^ ]*,)?all(,| )' <<< '$rules'"
+  last=$(grep -Ev '^[[:space:]]*(#|$)' "$repo/pg/pg_hba.conf" | tail -1)
+  check C-3 "last line of pg/pg_hba.conf is include_dir hba.d ($last)" test "$last" = "include_dir hba.d"
+  mounts=$(docker inspect -f '{{json .Mounts}}' "$(cid postgres)")
+  check C-3 "pg/hba.d is bind-mounted as a directory at /etc/postgresql/hba.d" bash -c \
+    "jq -e --arg src '$repo/pg/hba.d' 'any(.[]; .Type == \"bind\" and .Source == \$src and .Destination == \"/etc/postgresql/hba.d\")' <<< '$mounts' > /dev/null &&
+     docker exec '$(cid postgres)' test -d /etc/postgresql/hba.d"
+
+  # C-4: OpenFGA on its own database, after its migration. B-5: it reads its secrets from the file.
+  v=$(jq -r '.services.openfga.depends_on["openfga-migrate"].condition // "none"' <<< "$cfg")
+  check C-4 "openfga depends on openfga-migrate ($v)" test "$v" = service_completed_successfully
+  check C-4 "openfga-migrate exited 0" \
+    test "$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$(cid openfga-migrate)")" = "exited 0"
+  v=$(docker inspect -f '{{.State.Health.Status}}' "$(cid openfga)")
+  check C-4 "openfga is $v" test "$v" = healthy
+  v=$(dc exec -T -u postgres postgres psql -X -At -d openfga -c "select count(*) from goose_db_version" 2>&1)
+  check C-4 "OpenFGA's schema is in the openfga database (goose_db_version rows: $v)" test "${v:-0}" -gt 0 2> /dev/null
+  # shellcheck disable=SC2016 # expanded inside the probe
+  v=$(docker compose -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml" run --rm --no-deps -T \
+    -v "$repo/secrets/openfga-preshared-key:/run/k:ro" --entrypoint sh probe -c '
+      curl -s -o /dev/null -w "%{http_code} " http://openfga:8080/stores
+      curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $(cat /run/k)" http://openfga:8080/stores' 2> /dev/null)
+  check B-5 "OpenFGA refuses no key and accepts the preshared key from its config file ($v)" test "$v" = "401 200"
+}
+
+# jq as a test on stdin: exit status only.
+jqin() { jq -e "$@" > /dev/null; }
 
 # Decode one base64url JWT part to JSON.
 jwt_part() { local p; p=$(cut -d. -f"$2" <<< "$1" | tr '_-' '/+'); while [ $((${#p} % 4)) -ne 0 ]; do p+="="; done; base64 -d <<< "$p"; }
 
-# K-4, E-1, E-2 and B-5 for Keycloak, against the running stack (`scripts/up`). The project is
-# COMPOSE_PROJECT_NAME, or `setpiece` from compose.base.yaml.
+# K-4, E-1, E-2 and B-5 for Keycloak, against the running stack.
 section_k4() {
-  local dc=(docker compose -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml")
   local id nets idp d token header claims tenant probe
-  id=$("${dc[@]}" ps -q keycloak)
+  id=$(dc ps -q keycloak)
   if [ -z "$id" ]; then fail K-4 "keycloak is not running (run scripts/up first)"; return; fi
 
   nets=$(docker inspect "$id" --format '{{json .NetworkSettings.Networks}}' | jq -r 'keys[]')
@@ -168,8 +387,7 @@ section_k4() {
   d=$(mktemp -d)
   tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 > "$d/pw"
   chmod 0444 "$d/pw"
-  # shellcheck disable=SC2016 # expands inside the container
-  if ! "${dc[@]}" exec -T keycloak bash -c '
+  if ! dc exec -T keycloak bash -c '
       pw=$(cat); c=$(mktemp)
       kc=/opt/keycloak/bin/kcadm.sh
       # Passwords through KC_CLI_PASSWORD, never on a command line the host can read with ps.
@@ -184,7 +402,7 @@ section_k4() {
   check E-1 "realm.json holds no credentials" bash -c "! jq -e '[.. | objects | select(has(\"credentials\") or has(\"secret\"))] | length > 0' '$repo/keycloak/realm.json' > /dev/null"
 
   # The token, from the probe image attached to idp only.
-  probe=$("${dc[@]}" --profile probe config --format json | jq -r '.services.probe.image')
+  probe=$(dc --profile probe config --format json | jq -r '.services.probe.image')
   token=$(docker run --rm --network "$idp" --user 65532:65532 --read-only --cap-drop ALL \
       --security-opt no-new-privileges:true -v "$d/pw:/run/pw:ro" "$probe" -sS --fail-with-body \
       -d grant_type=password -d client_id=edge -d username=spike-user --data-urlencode password@/run/pw \
@@ -196,15 +414,18 @@ section_k4() {
   tenant=$(jq -r '.organizations[] | select(.alias == "spike") | .attributes.tenant_id[0]' "$repo/keycloak/realm.json")
   echo "        header: $(jq -c . <<< "$header")"
   echo "        claims: $(jq -c '{aud, client_id, azp, organization}' <<< "$claims")"
-  check K-4 "header typ is at+jwt" jqt '.typ == "at+jwt"' <<< "$header"
-  check K-4 "aud holds the edge client" jqt '[.aud] | flatten | index("edge") != null' <<< "$claims"
-  check K-4 "client_id is edge" jqt '.client_id == "edge"' <<< "$claims"
-  # shellcheck disable=SC2016 # a jq variable
+  check K-4 "header typ is at+jwt" jqin '.typ == "at+jwt"' <<< "$header"
+  check K-4 "aud holds the edge client" jqin '[.aud] | flatten | index("edge") != null' <<< "$claims"
+  check K-4 "client_id is edge" jqin '.client_id == "edge"' <<< "$claims"
   check K-4 "tenant_id is exactly the organisation's attribute ($tenant)" \
-    jqt --arg t "$tenant" '.organization.spike.tenant_id == [$t]' <<< "$claims"
+    jqin --arg t "$tenant" '.organization.spike.tenant_id == [$t]' <<< "$claims"
 }
 
-[ $# -gt 0 ] || { sed -n '2,6p' "$0"; exit 2; }
+[ $# -gt 0 ] || { sed -n '2,8p' "$0"; exit 2; }
+if [ "$1" = k1 ] && [ "${2:-}" = --from ]; then
+  [ $# -eq 5 ] || { echo "usage: scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>" >&2; exit 2; }
+  echo "== k1 --from $3"; section_k1_from "$3" "$4" "$5"; exit "$failed"
+fi
 for s in "$@"; do
   fn="section_${s//-/_}"
   if declare -F "$fn" > /dev/null; then echo "== $s"; "$fn"; else echo "unknown section: $s" >&2; exit 2; fi

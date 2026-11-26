@@ -22,15 +22,8 @@ all=("${base[@]}")
 [ -f compose.services.yaml ] && all+=(-f compose.services.yaml)
 
 # 2. Postgres and OpenFGA from the base file only, then fga-init once a model exists.
-#    Until both containers exist (build step 1, issue OUT-149), name only those that do.
-have=$(docker compose "${base[@]}" config --services 2> /dev/null || true)
-first=()
-for s in postgres openfga; do
-  grep -qx "$s" <<< "$have" && first+=("$s")
-done
-if [ ${#first[@]} -gt 0 ]; then
-  docker compose "${base[@]}" up -d --wait "${first[@]}"
-fi
+#    openfga-migrate and pg-init run as their dependencies and are never named (§4.10).
+docker compose "${base[@]}" up -d --wait postgres openfga
 if [ -f fga/fga.mod ]; then
   docker compose "${base[@]}" run --rm fga-init
 fi

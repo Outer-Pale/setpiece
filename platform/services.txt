@@ -1,3 +1,7 @@
 # The long-running containers scripts/up waits for (design checkpoint §4.10; punch list P-7).
 # One name per line. Each build step 1 issue appends the containers it adds.
+postgres
+openfga
+kong
+edge-auth
 keycloak
