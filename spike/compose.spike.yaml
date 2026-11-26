@@ -42,3 +42,21 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     networks: [services]
+
+  # The two targets of Kong's K-2 upstream.
+  target-a: &target
+    image: node:26@sha256:f8e5d4bb28fa55c74f1345166a082a10b7c68f22304350c1ce0d18358ae94996
+    command: ["node", "/app/target.mjs"]
+    environment:
+      TARGET_NAME: target-a
+    volumes:
+      - ./spike/target.mjs:/app/target.mjs:ro
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [services]
+  target-b:
+    <<: *target
+    environment:
+      TARGET_NAME: target-b
