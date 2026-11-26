@@ -1,0 +1,6 @@
+secrets/
+generated/
+.env
+.env.*
+pg/hba.d/*.conf
+node_modules/

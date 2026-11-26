@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          files=$(git ls-files 'scripts/*' '*.sh')
+          if [ -n "$files" ]; then shellcheck $files; else echo "no shell scripts yet"; fi
