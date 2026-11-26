@@ -3,6 +3,18 @@
 # commented cap_add list, restart unless-stopped, a health check, secrets as files only.
 name: setpiece
 
+# Container output goes to the OTel Collector through Docker's fluentd driver (§4.10; spec I-2).
+# Async and non-blocking with a buffer, so a container still starts while the Collector is down.
+# Every container uses it except the OTel Collector and otel-lgtm, which use `local`.
+x-logging: &logging
+  driver: fluentd
+  options:
+    fluentd-address: 127.0.0.1:24224
+    fluentd-async: "true"
+    mode: non-blocking
+    max-buffer-size: 4m
+    tag: "{{.Name}}"
+
 networks:
   # §4.12. Kong (443) is the only port published to the outside.
   edge: {}
@@ -17,4 +29,86 @@ networks:
   # The Collectors, Kong's status listener and otel-lgtm.
   ops: {}
 
-services: {}
+services:
+  # Receives OTLP and fluent-forward and sends to otel-lgtm (spec I-1). Its config file is
+  # its only mount. The image has no shell or HTTP client, so the health check runs the
+  # Collector's own binary (spec A-8).
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.166.0@sha256:3e18fe04181de50bdd72e23ad4a4d6214b54351e63d496f1c58127cc4541ad7f
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    # cap_add: none
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1:24224:24224"
+    networks: [services, ops]
+    logging:
+      driver: local
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Host metrics as far as a container sees them: no host /proc, Docker socket, container logs
+  # or ./secrets, and a uid no other container uses (spec I-1).
+  otel-hostmetrics:
+    image: otel/opentelemetry-collector-contrib:0.166.0@sha256:3e18fe04181de50bdd72e23ad4a4d6214b54351e63d496f1c58127cc4541ad7f
+    user: "10101:10101"
+    read_only: true
+    cap_drop: [ALL]
+    # cap_add: none
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    volumes:
+      - ./otel/hostmetrics.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks: [ops]
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Grafana, Loki, Tempo and Prometheus in one container, behind the Collector (R-9; §4.9).
+  # Metrics kept 35 days, logs and traces 7 days, on a named volume (spec I-3). Grafana only on
+  # 127.0.0.1, anonymous login off, admin password from a secret file (spec I-4).
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.41.1@sha256:1b852b77d7bcadb7699bfe7c78a51d059dff85168de674728cf7abf4474645e5
+    cap_drop: [ALL]
+    # cap_add: none
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    environment:
+      PROMETHEUS_EXTRA_ARGS: --storage.tsdb.retention.time=35d
+      LOKI_EXTRA_ARGS: -compactor.retention-enabled=true -compactor.delete-request-store=filesystem -store.retention=168h
+      TEMPO_EXTRA_ARGS: -backend-worker.compaction.block-retention=168h -backend-scheduler.provider.work.compaction.block-retention=168h
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_PASSWORD: $$__file{/run/secrets/grafana-admin}
+    secrets: [grafana-admin]
+    volumes:
+      - otel-lgtm-data:/data
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [ops]
+    logging:
+      driver: local
+    healthcheck:
+      test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  otel-lgtm-data: {}
+
+secrets:
+  grafana-admin:
+    file: ./secrets/grafana-admin

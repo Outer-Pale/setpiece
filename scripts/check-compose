@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Static checks on the Compose files, run in CI (E03 plan issue 1; spec K-6d, K-6c, A-7, A-8, B-6).
+# Static checks on the Compose files, run in CI (E03 plan issue 1; spec K-6d, K-6c, A-7, A-8, B-6;
+# issue 7 adds I-2's logging block).
 # The checks against the running stack are spike-check's (issue OUT-155).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -9,6 +10,7 @@ trap 'rm -f "$out"' EXIT
 config=$(docker compose -f compose.base.yaml -f spike/compose.spike.yaml --profile "*" config --format json)
 long_running=$(sed -E 's/#.*//; s/[[:space:]]//g; /^$/d' platform/services.txt)
 
+# B-6 accepts a secret file's path, or Grafana's $__file{} reference to one ($$ is Compose's escape).
 jq -r --arg lr "$long_running" '
   ($lr | split("\n") | map(select(length > 0))) as $long
   | .services // {} | to_entries[] | .key as $n | .value as $s
@@ -25,9 +27,21 @@ jq -r --arg lr "$long_running" '
       else empty end ),
     ( ($s.environment // {}) | to_entries[]
       | select(.key | test("PASSWORD|SECRET|TOKEN|KEY"; "i"))
-      | select((.value // "") | tostring | test("^/run/secrets/[A-Za-z0-9._-]+$") | not)
+      | select((.value // "") | tostring
+               | test("^(/run/secrets/[A-Za-z0-9._-]+|\\$\\$?__file\\{/run/secrets/[A-Za-z0-9._-]+\\})$") | not)
       | "\($n): \(.key) has a literal value in environment (B-6)" )
 ' <<< "$config" > "$out"
+
+# I-2: every base container except the OTel Collector and otel-lgtm logs through the fluentd driver
+# (§4.10). Base file only: the test overlay's one-shot probe keeps the default driver.
+docker compose -f compose.base.yaml config --format json | jq -r '
+  .services // {} | to_entries[] | select(.key != "otel-collector" and .key != "otel-lgtm")
+  | .key as $n | .value.logging as $l
+  | if ($l.driver == "fluentd" and $l.options["fluentd-address"] == "127.0.0.1:24224"
+        and $l.options["fluentd-async"] == "true" and $l.options.mode == "non-blocking"
+        and ($l.options["max-buffer-size"] // "") != "") then empty
+    else "\($n): not on the fluentd logging block (x-logging, I-2)" end
+' >> "$out"
 
 if [ -s "$out" ]; then
   cat "$out"

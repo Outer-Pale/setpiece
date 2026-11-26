@@ -1,0 +1,37 @@
+# The OTel Collector (design checkpoint §4.9, §4.10; E03 spec I-1, I-2). Receives OTLP from
+# services and the host-metrics Collector, and container output from Docker's fluentd log
+# driver, and sends everything to otel-lgtm. Its only mount is this file.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  # Published on the host as 127.0.0.1:24224 only, for the daemon's fluentd driver.
+  fluentforward:
+    endpoint: 0.0.0.0:24224
+
+processors:
+  batch: {}
+
+exporters:
+  otlp_grpc:
+    endpoint: otel-lgtm:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_grpc]
+    logs:
+      receivers: [otlp, fluentforward]
+      processors: [batch]
+      exporters: [otlp_grpc]

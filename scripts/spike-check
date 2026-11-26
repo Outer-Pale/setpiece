@@ -2,7 +2,9 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config telemetry
+# Sections that need the running stack (telemetry) expect `scripts/up` to have run first, with the
+# same COMPOSE_PROJECT_NAME if one is set.
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
 # shellcheck disable=SC2329
 set -uo pipefail
@@ -109,6 +111,7 @@ section_up_order() {
   d=$(sandbox)
   fake_docker "$d/bin"
   # Nothing generated, no services yet: only the version and config calls, no up, no fga-init.
+  : > "$d/platform/services.txt"
   FAKE_LOG="$d/log" FAKE_VERSION=5.5.1 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up"
   log=$(cat "$d/log")
   check A-2 "no compose.services.yaml: only compose.base.yaml is named" bash -c "! grep -q compose.services.yaml <<< '$log'"
@@ -141,7 +144,159 @@ section_static_config() {
   check K-6d "static compose checks (digests, cap_drop, restart, health check, no literal secrets)" test "$rc" -eq 0
 }
 
-[ $# -gt 0 ] || { sed -n '2,6p' "$0"; exit 2; }
+# The stack's Compose command, with the test overlay (spec §2a).
+dc() { docker compose -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml" "$@"; }
+cid_of() { dc ps -q "$1" 2> /dev/null | head -1; }
+lgtm() { dc exec -T otel-lgtm "$@"; }
+# Lines in Loki (inside otel-lgtm) holding $1, over the last hour.
+loki_count() {
+  lgtm curl -sG localhost:3100/loki/api/v1/query_range \
+    --data-urlencode "query={service_name=~\".+\"} |= \"$1\"" --data-urlencode since=1h |
+    jq '[.data.result[]?.values[]?] | length' 2> /dev/null || echo 0
+}
+# Waits up to $2 seconds for $1 to appear in Loki; prints the seconds it took, or fails.
+wait_loki() {
+  local t0=$SECONDS n
+  while [ $((SECONDS - t0)) -le "$2" ]; do
+    n=$(loki_count "$1")
+    [ "${n:-0}" -gt 0 ] 2> /dev/null && { echo $((SECONDS - t0)); return 0; }
+    sleep 5
+  done
+  return 1
+}
+
+section_telemetry() {
+  local col hm lg c n u m v t secs logopts
+  col=$(cid_of otel-collector); hm=$(cid_of otel-hostmetrics); lg=$(cid_of otel-lgtm)
+  if [ -z "$col" ] || [ -z "$hm" ] || [ -z "$lg" ]; then
+    fail I-1 "otel-collector, otel-hostmetrics and otel-lgtm are not all running (run scripts/up first)"
+    return
+  fi
+  insp() { docker inspect -f "$2" "$1"; }
+  caps_none() { [ "$1" = '["ALL"] null' ] || [ "$1" = '["ALL"] []' ]; }
+  # Network names without the project prefix, sorted, space-separated.
+  # shellcheck disable=SC2016
+  nets() { insp "$1" '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' | tr ' ' '\n' | sed -E '/^$/d; s/.*_//' | sort | tr '\n' ' '; }
+
+  # I-1: the OTel Collector.
+  n=$(nets "$col")
+  check I-1 "otel-collector is on services and ops only ($n)" test "$n" = "ops services "
+  u=$(insp "$col" '{{.Config.User}}')
+  check I-1 "otel-collector runs as a non-root uid ($u)" bash -c "[[ '$u' =~ ^[1-9][0-9]*(:[0-9]+)?$ ]]"
+  c=$(insp "$col" '{{json .HostConfig.CapDrop}} {{json .HostConfig.CapAdd}}')
+  check I-1 "otel-collector drops ALL capabilities and adds none ($c)" caps_none "$c"
+  m=$(insp "$col" '{{range .Mounts}}{{.Type}}:{{.Source}}:{{.Destination}} {{end}}')
+  check I-1 "otel-collector's only mount is its config file ($m)" \
+    bash -c "[[ '$m' =~ ^bind:[^\ ]*/otel/collector\.yaml:/etc/otelcol-contrib/config\.yaml\ $ ]]"
+  # shellcheck disable=SC2016
+  t=$(insp "$col" '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{$p}}={{.HostIp}}:{{.HostPort}} {{end}}{{end}}')
+  check I-1 "otel-collector publishes fluent-forward on 127.0.0.1:24224 only ($t)" test "$t" = "24224/tcp=127.0.0.1:24224 "
+  t=$(insp "$col" '{{.HostConfig.LogConfig.Type}}')
+  check I-1 "otel-collector uses the local log driver ($t)" test "$t" = local
+
+  # I-1: the host-metrics Collector.
+  n=$(nets "$hm")
+  check I-1 "otel-hostmetrics is on ops only ($n)" test "$n" = "ops "
+  u=$(insp "$hm" '{{.Config.User}}')
+  check I-1 "otel-hostmetrics runs as a non-root uid ($u)" bash -c "[[ '$u' =~ ^[1-9][0-9]*(:[0-9]+)?$ ]]"
+  local others
+  others=$(for x in $(dc ps -aq); do [ "$x" = "$hm" ] || docker inspect -f '{{.Config.User}}' "$x"; done | sed 's/:.*//' | sort -u | tr '\n' ' ')
+  check I-1 "otel-hostmetrics' uid ${u%%:*} is used by no other container (others: ${others:-none})" \
+    bash -c "! grep -qw -- '${u%%:*}' <<< '$others'"
+  c=$(insp "$hm" '{{json .HostConfig.CapDrop}} {{json .HostConfig.CapAdd}}')
+  check I-1 "otel-hostmetrics drops ALL capabilities and adds none ($c)" caps_none "$c"
+  m=$(insp "$hm" '{{range .Mounts}}{{.Type}}:{{.Source}}:{{.Destination}} {{end}}')
+  check I-1 "otel-hostmetrics' only mount is its config file: no /proc, Docker socket, logs or secrets ($m)" \
+    bash -c "[[ '$m' =~ ^bind:[^\ ]*/otel/hostmetrics\.yaml:/etc/otelcol-contrib/config\.yaml\ $ ]]"
+  t=$(insp "$hm" '{{.HostConfig.LogConfig.Type}}')
+  check I-1 "otel-hostmetrics uses the fluentd log driver ($t)" test "$t" = fluentd
+  t=$(insp "$lg" '{{.HostConfig.LogConfig.Type}}')
+  check I-1 "otel-lgtm uses the local log driver ($t)" test "$t" = local
+
+  # I-1: OTLP in through the Collector, out to otel-lgtm: a log record posted from the stand-in on `services`.
+  m="spike-otlp-$(date +%s)-$RANDOM"
+  t=$(jq -nc --arg m "$m" '{resourceLogs:[{resource:{attributes:[{key:"service.name",value:{stringValue:"spike-check"}}]},
+      scopeLogs:[{logRecords:[{body:{stringValue:$m}}]}]}]}')
+  c=$(dc run --rm -T stand-in wget -q -O /dev/null --header 'Content-Type: application/json' --post-data "$t" \
+    http://otel-collector:4318/v1/logs 2> /dev/null && echo posted)
+  if secs=$(wait_loki "$m" 60); then
+    pass I-1 "OTLP log posted to otel-collector:4318 (${c:-no answer}) reached Loki in otel-lgtm in ${secs}s"
+  else
+    fail I-1 "OTLP log posted to otel-collector:4318 (${c:-no answer}) not in Loki after 60s"
+  fi
+
+  # I-2: every running container except the Collector and otel-lgtm uses the fluentd driver as
+  # §4.10 says (check-compose checks the same in the Compose file, for CI).
+  logopts=""
+  for c in $(dc ps -aq); do
+    [ "$c" = "$col" ] || [ "$c" = "$lg" ] && continue
+    t=$(docker inspect -f '{{.Name}} {{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "fluentd-address"}} {{index .HostConfig.LogConfig.Config "fluentd-async"}} {{index .HostConfig.LogConfig.Config "mode"}} {{index .HostConfig.LogConfig.Config "max-buffer-size"}}' "$c")
+    [[ $t =~ ^[^\ ]+\ fluentd\ 127\.0\.0\.1:24224\ true\ non-blocking\ [0-9]+[kmg]?$ ]] || logopts+=" ${t%% *}"
+  done
+  check I-2 "every other container logs to fluentd 127.0.0.1:24224, async, non-blocking, buffered (offenders:${logopts:- none})" \
+    test -z "$logopts"
+
+  # I-2: a container started while the Collector is stopped still starts, and its lines arrive later.
+  m="spike-marker-$(date +%s)-$RANDOM"
+  dc stop otel-collector > /dev/null 2>&1
+  c=$(dc run -d --rm stand-in sh -c "echo $m; exec sleep 600" 2> /dev/null)
+  t=$(docker inspect -f '{{.State.Status}}' "$c" 2> /dev/null)
+  check I-2 "stand-in started while otel-collector was stopped (state: ${t:-not created})" test "$t" = running
+  dc start otel-collector > /dev/null 2>&1
+  if secs=$(wait_loki "$m" 180); then
+    pass I-2 "the stand-in's marker reached Loki ${secs}s after the Collector came back"
+  else
+    fail I-2 "the stand-in's marker was not in Loki 180s after the Collector came back"
+  fi
+  [ -n "$c" ] && docker rm -f "$c" > /dev/null 2>&1
+
+  # I-3: retention, and data surviving a recreate.
+  t=$(lgtm curl -s localhost:9090/api/v1/status/flags | jq -r '.data["storage.tsdb.retention.time"]')
+  # Prometheus prints the flag normalised: 35d comes back as 5w.
+  check I-3 "Prometheus --storage.tsdb.retention.time is 35 days ($t)" bash -c "[[ '$t' = 35d || '$t' = 5w ]]"
+  t=$(lgtm curl -s localhost:3100/config | grep -E '^\s+(retention_enabled|retention_period):' | tr -s ' ' | tr '\n' ' ')
+  check I-3 "Loki retention is on and 7 days ($t)" bash -c "grep -q 'retention_enabled: true' <<< '$t' && grep -Eq 'retention_period: (1w|7d|168h)' <<< '$t'"
+  t=$(lgtm curl -s localhost:3200/status/config | grep -oE '[^_]block_retention: [^ ]+' | sed 's/^.//' | sort -u | tr '\n' ' ')
+  check I-3 "Tempo block retention is 7 days ($t)" test "$t" = "block_retention: 168h0m0s "
+  t=$(insp "$lg" '{{range .Mounts}}{{.Type}}:{{.Name}}:{{.Destination}} {{end}}')
+  check I-3 "otel-lgtm keeps /data on a named volume ($t)" bash -c "grep -Eq 'volume:[^ :]+:/data( |$)' <<< '$t'"
+
+  v=$RANDOM; local now
+  now=$(date +%s)
+  t=$(jq -nc --arg v "$v" --arg t "${now}000000000" '{resourceMetrics:[{resource:{attributes:[{key:"service.name",value:{stringValue:"spike-check"}}]},
+      scopeMetrics:[{metrics:[{name:"spike_marker",gauge:{dataPoints:[{asDouble:($v|tonumber),timeUnixNano:$t}]}}]}]}]}')
+  lgtm curl -s -o /dev/null -H 'Content-Type: application/json' -d "$t" localhost:4318/v1/metrics
+  marker() {
+    local r
+    for _ in $(seq 1 12); do
+      r=$(lgtm curl -sG localhost:9090/api/v1/query --data-urlencode query=spike_marker \
+        --data-urlencode time=$((now + 1)) 2> /dev/null | jq -r '.data.result[0].value[1] // empty' 2> /dev/null)
+      [ "$r" = "$v" ] && { echo "$r"; return 0; }
+      sleep 5
+    done
+    echo "${r:-none}"; return 1
+  }
+  t=$(marker)
+  check I-3 "marker metric spike_marker=$v stored before the recreate (read $t)" test "$t" = "$v"
+  dc up -d --wait --force-recreate otel-lgtm > /dev/null 2>&1
+  c=$(cid_of otel-lgtm)
+  check I-3 "otel-lgtm was recreated (${lg:0:12} -> ${c:0:12})" test -n "$c" -a "$c" != "$lg"
+  t=$(marker)
+  check I-3 "marker metric spike_marker=$v still there after the recreate (read $t)" test "$t" = "$v"
+
+  # I-4: Grafana on 127.0.0.1 only, anonymous off, admin password from the secret file.
+  t=$(docker port "$c" 3000/tcp | tr '\n' ' ')
+  check I-4 "Grafana is published on 127.0.0.1 only ($t)" bash -c "[[ '$t' =~ ^127\.0\.0\.1:[0-9]+\ $ ]]"
+  local gp=${t##*:}; gp=${gp%% *}
+  t=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$gp/api/org")
+  check I-4 "anonymous GET /api/org is refused (HTTP $t)" test "$t" = 401
+  t=$(curl -s -o /dev/null -w '%{http_code}' -u "admin:$(cat "$repo/secrets/grafana-admin")" "http://127.0.0.1:$gp/api/org")
+  check I-4 "admin with the password in secrets/grafana-admin is accepted (HTTP $t)" test "$t" = 200
+  t=$(curl -s -o /dev/null -w '%{http_code}' -u admin:admin "http://127.0.0.1:$gp/api/org")
+  check I-4 "the image's default admin:admin is refused (HTTP $t)" test "$t" = 401
+}
+
+[ $# -gt 0 ] || { sed -n '2,8p' "$0"; exit 2; }
 for s in "$@"; do
   fn="section_${s//-/_}"
   if declare -F "$fn" > /dev/null; then echo "== $s"; "$fn"; else echo "unknown section: $s" >&2; exit 2; fi
