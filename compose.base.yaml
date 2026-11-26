@@ -232,7 +232,6 @@ services:
       timeout: 10s
       retries: 10
       start_period: 60s
-
   # Keycloak (M0014), on its own database from pg-init (spec C-2, E-1). On `idp` only (§4.12;
   # punch list P-6). Its passwords come from mounted files through keycloak/start.sh (B-5, B-6).
   keycloak:
