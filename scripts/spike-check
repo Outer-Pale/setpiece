@@ -402,7 +402,7 @@ k3_run() {
     fail K-3 "fixture did not start: $(tail -3 "$d/init.log" "$d/c.log" | tr '\n' ' ')"; return
   fi
   for i in $(seq 60); do connect_api GET /connectors > /dev/null 2>&1 && break; sleep 3; done
-  # D-014 option (a): Debezium's heartbeat record is produced, so its offset commits and the slot
+  # §4.2 erratum (E03 D-014): Debezium's heartbeat record is produced, so its offset commits and the slot
   # moves. Its topic and connect-producer's write ACL stand in for what kafka-init would generate.
   kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --create --if-not-exists \
     --topic __debezium-heartbeat.cdc.spike --partitions 1 --replication-factor 1 > /dev/null 2>&1
