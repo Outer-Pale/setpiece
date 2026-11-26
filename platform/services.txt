@@ -7,3 +7,4 @@ edge-auth
 otel-collector
 otel-hostmetrics
 otel-lgtm
+keycloak
