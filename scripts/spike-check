@@ -356,12 +356,14 @@ k3_records() {
 # Waits until ev.spike.example holds at least $2 records with key $1; leaves them in $3.
 k3_wait() { local i; for i in $(seq 8); do k3_records | jq -c --arg k "$1" 'select(.key == $k)' > "$3"
   [ "$(wc -l < "$3")" -ge "$2" ] && return 0; done; return 1; }
-# Inserts one outbox row with every column set. Prints the row as JSON.
+# Inserts one outbox row with every column set, with seq $4 if given. Prints the row as JSON.
 k3_insert() {
-  psql_spike "insert into chassis_outbox (id, kind, topic, aggregatetype, aggregateid, type, payload, ce_subject,
+  local sc="" sv="" ov=""
+  [ -n "${4:-}" ] && { sc="seq, "; sv="$4, "; ov="overriding system value"; }
+  psql_spike "insert into chassis_outbox (${sc}id, kind, topic, aggregatetype, aggregateid, type, payload, ce_subject,
       ce_dataschema, ce_tenantid, ce_aggregateversion, ce_correlationid, ce_causationid, ce_traceparent,
-      ce_authtype, ce_authid, ce_authclaims)
-    values (gen_random_uuid(), 'event', '$1', 'example', '$2', 'spike.example.created.v1',
+      ce_authtype, ce_authid, ce_authclaims) $ov
+    values (${sv}gen_random_uuid(), 'event', '$1', 'example', '$2', 'spike.example.created.v1',
       '{\"run\": \"$2\", \"n\": $3}', 'examples/$2', 'https://schemas.setpiece.invalid/spike/example/v1.json',
       'tenant-spike', $3, 'corr-$2', 'cause-$2', '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
       'user', 'sub-spike', '{\"client_id\": \"spike-client\"}')
@@ -479,12 +481,16 @@ k3_run() {
     lsn_after "$lsn1" "$lsn2"
 
   # K-3d: three rows on one key, then stop, delete the offsets and resume (§4.2 recovery 1, 3, 4).
-  ids=""
-  for i in 1 2 3; do ids+="$(k3_insert ev.spike.example "$run-d" "$i" | jq -r .id) "; done
+  # Three seq values are taken first and the rows inserted as 3, 1, 2, so the heap is out of seq
+  # order and a snapshot without the `order by seq` override would not publish them in order.
+  local sq s1 id1 id2 id3
+  sq=$(psql_spike "select pg_get_serial_sequence('chassis_outbox', 'seq')")
+  s1=$(psql_spike "select min(v) from (select nextval('$sq') as v from generate_series(1, 3)) t")
+  id3=$(k3_insert ev.spike.example "$run-d" 3 $((s1 + 2)) | jq -r .id)
+  id1=$(k3_insert ev.spike.example "$run-d" 1 "$s1" | jq -r .id)
+  id2=$(k3_insert ev.spike.example "$run-d" 2 $((s1 + 1)) | jq -r .id)
+  ids="$id1 $id2 $id3 "
   k3_wait "$run-d" 3 "$d/d1.json"
-  # A no-op update moves the first row behind the others in the heap, so a snapshot without the
-  # `order by seq` override would publish it last. EventRouter skips updates (warn).
-  psql_spike "update chassis_outbox set ce_causationid = ce_causationid where id = '${ids%% *}'"
   order=$(psql_spike "select array_agg(seq order by ctid) = array_agg(seq order by seq) from chassis_outbox where aggregateid = '$run-d'")
   check K-3d "precondition: the key's rows are out of seq order in the heap" test "$order" = f
   connect_api PUT /connectors/spike/stop > /dev/null
