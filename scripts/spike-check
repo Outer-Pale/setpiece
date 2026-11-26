@@ -2,8 +2,9 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 pg
 #        scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>   (K-1 (b), off the host)
+# Sections that need the running stack use the Compose project in COMPOSE_PROJECT_NAME, if set.
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
 # jq programs are single-quoted on purpose (SC2016).
 # shellcheck disable=SC2329,SC2016
@@ -32,7 +33,7 @@ entries() { sed -E 's/#.*//' "$repo/platform/secrets.base.yaml" | grep -E ':' | 
 files_of() { entries | awk -F: -v k="$1" '$2 == k { print $1 }'; }
 
 section_secrets() {
-  local d h1 h2 f bad
+  local d h1 h2 f bad fga
   d=$(sandbox)
   "$d/scripts/secrets-init" "$d"
   h1=$(cd "$d/secrets" && sha256sum ./* | sort)
@@ -42,6 +43,7 @@ section_secrets() {
   bad=""
   for f in $(files_of password) $(files_of pem-key); do [ -f "$d/secrets/$f" ] || bad+=" $f"; done
   for f in $(files_of certificate); do [ -f "$d/secrets/$f.crt" ] && [ -f "$d/secrets/$f.key" ] || bad+=" $f"; done
+  for f in $(files_of config); do [ -f "$d/secrets/$f" ] || bad+=" $f"; done
   check B-1 "every base secret written (missing:${bad:- none})" test -z "$bad"
   check B-1 "second run changes no file" test "$h1" = "$h2"
   check B-1 "generated/fga.env exists and is empty" test -f "$d/generated/fga.env" -a ! -s "$d/generated/fga.env"
@@ -62,6 +64,11 @@ section_secrets() {
   done
   check B-2 "pem-key files are Ed25519 PKCS#8 (offenders:${bad:- none})" test -z "$bad"
 
+  fga=$d/secrets/openfga-config
+  check B-5 "openfga-config holds the openfga-db password and the preshared key" bash -c \
+    "grep -qF \"//openfga:\$(cat '$d/secrets/openfga-db')@postgres:5432/openfga?\" '$fga' &&
+     grep -qxF \"      - \$(cat '$d/secrets/openfga-preshared-key')\" '$fga'"
+
   for f in $(files_of certificate); do
     check B-3 "$f.crt subject: $(openssl x509 -in "$d/secrets/$f.crt" -noout -subject 2> /dev/null)" \
       bash -c "openssl x509 -in '$d/secrets/$f.crt' -noout -subject | grep -q self-signed"
@@ -75,7 +82,7 @@ section_secrets() {
   rm -rf "$d"
 }
 
-# A fake `docker` that records its arguments. FAKE_VERSION and FAKE_SERVICES set its answers.
+# A fake `docker` that records its arguments. FAKE_VERSION sets its answer to `version`.
 fake_docker() {
   local bin=$1
   mkdir -p "$bin"
@@ -85,7 +92,6 @@ if [ -e secrets/kafka-admin ]; then sec=y; else sec=n; fi
 echo "docker $* [secrets=$sec]" >> "$FAKE_LOG"
 case " $* " in
   *" version --short "*) echo "$FAKE_VERSION" ;;
-  *" config --services "*) printf '%s\n' $FAKE_SERVICES ;;
 esac
 EOF
   chmod +x "$bin/docker"
@@ -95,12 +101,12 @@ section_up_version() {
   local d rc
   d=$(sandbox)
   fake_docker "$d/bin"
-  FAKE_LOG="$d/log" FAKE_VERSION=9.9.9 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
+  FAKE_LOG="$d/log" FAKE_VERSION=9.9.9 PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
   rc=$?
   check A-5 "refuses Compose 9.9.9 (exit $rc: $(cat "$d/err"))" test "$rc" -ne 0
   check A-5 "nothing started: no secrets written, no up call" \
     bash -c "[ ! -e '$d/secrets' ] && ! grep -q ' up ' '$d/log'"
-  FAKE_LOG="$d/log2" FAKE_VERSION=v5.5.1 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
+  FAKE_LOG="$d/log2" FAKE_VERSION=v5.5.1 PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
   rc=$?
   check A-5 "accepts the pinned version (exit $rc)" test "$rc" -eq 0 -a -f "$d/secrets/kafka-admin"
   rm -rf "$d"
@@ -110,18 +116,17 @@ section_up_order() {
   local d log
   d=$(sandbox)
   fake_docker "$d/bin"
-  # Nothing generated, no services yet: only the version and config calls, no up, no fga-init.
-  printf '# none\n' > "$d/platform/services.txt"
-  FAKE_LOG="$d/log" FAKE_VERSION=5.5.1 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up"
+  # Nothing generated and an empty services list: step 2 only, no fga-init, no step 3.
+  : > "$d/platform/services.txt"
+  FAKE_LOG="$d/log" FAKE_VERSION=5.5.1 PATH="$d/bin:$PATH" "$d/scripts/up"
   log=$(cat "$d/log")
   check A-2 "no compose.services.yaml: only compose.base.yaml is named" bash -c "! grep -q compose.services.yaml <<< '$log'"
   check A-2 "no fga/fga.mod: fga-init not run" bash -c "! grep -q fga-init <<< '$log'"
-  check A-3 "empty services list and no postgres/openfga: no up call" bash -c "! grep -q ' up ' <<< '$log'"
+  check A-3 "empty services list: one up call, step 2's" bash -c "[ \"\$(grep -c ' up ' <<< '$log')\" = 1 ]"
 
   # With a stand-in list: step 2 names only postgres and openfga, step 3 names the list, in that order.
   printf 'kong\nedge-auth\n' > "$d/platform/services.txt"
-  FAKE_LOG="$d/log2" FAKE_VERSION=5.5.1 FAKE_SERVICES="postgres openfga pg-init kong edge-auth" \
-    PATH="$d/bin:$PATH" "$d/scripts/up"
+  FAKE_LOG="$d/log2" FAKE_VERSION=5.5.1 PATH="$d/bin:$PATH" "$d/scripts/up"
   log=$(grep ' up ' "$d/log2" | sed 's/ \[secrets=.\]$//')
   local first_up
   first_up=$(grep -m1 ' up ' "$d/log2")
@@ -257,7 +262,107 @@ section_k1_from() {
   notrun K-1 "(b) separate buckets: run this on a second device within the same minute; it should get 200s"
 }
 
-[ $# -gt 0 ] || { sed -n '2,7p' "$0"; exit 2; }
+psql_su() { dc exec -T -u postgres postgres psql -X -At -v ON_ERROR_STOP=1 -d postgres -c "$1"; }
+cid() { dc ps -a -q "$1"; }
+# Databases with owner and ACL, and roles with login and memberships: what a repeat must not change.
+pg_objects() {
+  psql_su "select 'db ' || datname || ' ' || pg_get_userbyid(datdba) || ' ' || coalesce(datacl::text, '')
+           from pg_database order by datname"
+  psql_su "select 'role ' || r.rolname || ' ' || r.rolcanlogin || ' ' || coalesce((select string_agg(b.rolname, ','
+             order by b.rolname) from pg_auth_members m join pg_roles b on b.oid = m.roleid where m.member = r.oid), '')
+           from pg_roles r where r.rolname !~ '^pg_' order by r.rolname"
+}
+
+section_pg() {
+  local s v db before after rc rules last mounts cfg
+  # C-1: the slot settings, as fixed constants.
+  for s in wal_level=logical max_replication_slots=16 max_wal_senders=16 max_slot_wal_keep_size=10GB; do
+    v=$(psql_su "show ${s%%=*}")
+    check C-1 "${s%%=*} = $v" test "$v" = "${s#*=}"
+  done
+
+  # C-2: databases, roles, pg_monitor, CONNECT revoked from PUBLIC, and a repeat changes nothing.
+  check C-2 "pg-init exited 0 on this bring-up" \
+    test "$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$(cid pg-init)")" = "exited 0"
+  for db in keycloak openfga monitor; do
+    v=$(psql_su "select pg_get_userbyid(datdba) from pg_database where datname = '$db'")
+    check C-2 "database $db exists, owned by '$v'" test "$v" = "$db"
+  done
+  v=$(psql_su "select pg_has_role('monitor', 'pg_monitor', 'member')")
+  check C-2 "monitor is in pg_monitor ($v)" test "$v" = t
+  for db in postgres keycloak openfga; do
+    v=$(psql_su "select has_database_privilege('public', '$db', 'connect')")
+    check C-2 "PUBLIC cannot connect to $db ($v)" test "$v" = f
+  done
+  # Each role signs in to its own database with the password from its secret file, and not to another.
+  # shellcheck disable=SC2016 # expanded inside the container
+  v=$(dc run --rm --no-deps -T --entrypoint sh pg-init -c '
+    umask 077
+    for r in keycloak openfga monitor; do
+      printf "postgres:5432:*:%s:%s\n" "$r" "$(cat /run/secrets/$r-db)" > /tmp/pgpass
+      PGPASSFILE=/tmp/pgpass psql -X -At -h postgres -U "$r" -d "$r" -c "select current_user" 2>&1
+    done
+    printf "postgres:5432:*:keycloak:%s\n" "$(cat /run/secrets/keycloak-db)" > /tmp/pgpass
+    PGPASSFILE=/tmp/pgpass psql -X -At -h postgres -U keycloak -d openfga -c "select 1" > /dev/null 2>&1 &&
+      echo keycloak-reached-openfga || echo keycloak-refused-openfga' 2> /dev/null)
+  echo "        $(tr '\n' ' ' <<< "$v")"
+  check C-2 "keycloak, openfga and monitor sign in with their secret-file passwords" \
+    test "$(head -3 <<< "$v" | tr '\n' ' ')" = "keycloak openfga monitor "
+  check C-3 "keycloak cannot sign in to the openfga database" grep -qx keycloak-refused-openfga <<< "$v"
+
+  before=$(pg_objects)
+  dc run --rm --no-deps -T pg-init 2>&1 | grep -v ' Container ' | sed 's/^/        /'
+  rc=${PIPESTATUS[0]}
+  after=$(pg_objects)
+  check C-2 "a second pg-init exits 0 ($rc)" test "$rc" -eq 0
+  check C-2 "a second pg-init changes no database or role" test "$before" = "$after"
+  cfg=$(dc config --format json)
+  v=$(jq -r '.services["openfga-migrate"].depends_on["pg-init"].condition // "none"' <<< "$cfg")
+  check C-2 "openfga-migrate depends on pg-init ($v)" test "$v" = service_completed_successfully
+  if jq -e '.services.keycloak' <<< "$cfg" > /dev/null; then
+    v=$(jq -r '.services.keycloak.depends_on["pg-init"].condition // "none"' <<< "$cfg")
+    check C-2 "keycloak depends on pg-init ($v)" test "$v" = service_completed_successfully
+  else
+    notrun C-2 "keycloak depends on pg-init: no keycloak yet (OUT-151)"
+  fi
+
+  # C-3: the allowlist as the server loaded it, include_dir last, and hba.d mounted as a directory.
+  check C-3 "hba_file is the mounted base file" test "$(psql_su 'show hba_file')" = /etc/postgresql/pg_hba.conf
+  rules=$(psql_su "select type || ' ' || array_to_string(database, ',') || ' ' || array_to_string(user_name, ',')
+                   || ' ' || coalesce(address, '-') || ' ' || auth_method from pg_hba_file_rules
+                   where error is null order by rule_number")
+  printf '%s\n' "$rules" | sed 's/^/        /'
+  check C-3 "no pg_hba error" test "$(psql_su 'select count(*) from pg_hba_file_rules where error is not null')" = 0
+  for s in "host all postgres samenet scram-sha-256" "host keycloak keycloak samenet scram-sha-256" \
+    "host openfga openfga samenet scram-sha-256" "host monitor monitor samenet scram-sha-256"; do
+    check C-3 "rule: $s" grep -qxF "$s" <<< "$rules"
+  done
+  check C-3 "no replication rule for all users" bash -c "! grep -Eq '^host[a-z]* ([^ ]*,)?replication(,[^ ]*)? ([^ ]*,)?all(,| )' <<< '$rules'"
+  last=$(grep -Ev '^[[:space:]]*(#|$)' "$repo/pg/pg_hba.conf" | tail -1)
+  check C-3 "last line of pg/pg_hba.conf is include_dir hba.d ($last)" test "$last" = "include_dir hba.d"
+  mounts=$(docker inspect -f '{{json .Mounts}}' "$(cid postgres)")
+  check C-3 "pg/hba.d is bind-mounted as a directory at /etc/postgresql/hba.d" bash -c \
+    "jq -e --arg src '$repo/pg/hba.d' 'any(.[]; .Type == \"bind\" and .Source == \$src and .Destination == \"/etc/postgresql/hba.d\")' <<< '$mounts' > /dev/null &&
+     docker exec '$(cid postgres)' test -d /etc/postgresql/hba.d"
+
+  # C-4: OpenFGA on its own database, after its migration. B-5: it reads its secrets from the file.
+  v=$(jq -r '.services.openfga.depends_on["openfga-migrate"].condition // "none"' <<< "$cfg")
+  check C-4 "openfga depends on openfga-migrate ($v)" test "$v" = service_completed_successfully
+  check C-4 "openfga-migrate exited 0" \
+    test "$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$(cid openfga-migrate)")" = "exited 0"
+  v=$(docker inspect -f '{{.State.Health.Status}}' "$(cid openfga)")
+  check C-4 "openfga is $v" test "$v" = healthy
+  v=$(dc exec -T -u postgres postgres psql -X -At -d openfga -c "select count(*) from goose_db_version" 2>&1)
+  check C-4 "OpenFGA's schema is in the openfga database (goose_db_version rows: $v)" test "${v:-0}" -gt 0 2> /dev/null
+  # shellcheck disable=SC2016 # expanded inside the probe
+  v=$(docker compose -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml" run --rm --no-deps -T \
+    -v "$repo/secrets/openfga-preshared-key:/run/k:ro" --entrypoint sh probe -c '
+      curl -s -o /dev/null -w "%{http_code} " http://openfga:8080/stores
+      curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $(cat /run/k)" http://openfga:8080/stores' 2> /dev/null)
+  check B-5 "OpenFGA refuses no key and accepts the preshared key from its config file ($v)" test "$v" = "401 200"
+}
+
+[ $# -gt 0 ] || { sed -n '2,8p' "$0"; exit 2; }
 if [ "$1" = k1 ] && [ "${2:-}" = --from ]; then
   [ $# -eq 5 ] || { echo "usage: scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>" >&2; exit 2; }
   echo "== k1 --from $3"; section_k1_from "$3" "$4" "$5"; exit "$failed"
