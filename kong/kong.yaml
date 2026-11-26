@@ -4,7 +4,34 @@
 #   pre-function (1000000), then rate-limiting (910), then post-function (-1000).
 _format_version: "3.0"
 
+# K-2: two targets, an active check on /readyz and a passive check on 5xx (§4.6).
+# A target that fails stays out until an active check on /readyz passes again.
+upstreams:
+  - name: spike-k2
+    targets:
+      - target: target-a:8080
+      - target: target-b:8080
+    healthchecks:
+      active:
+        type: http
+        http_path: /readyz
+        timeout: 1
+        healthy: { interval: 1, successes: 1 }
+        unhealthy: { interval: 5, http_failures: 1, timeouts: 1, tcp_failures: 1 }
+      passive:
+        type: http
+        unhealthy: { http_failures: 2, http_statuses: [500, 502, 503] }
+
 services:
+  - name: spike-k2
+    host: spike-k2
+    port: 8080
+    protocol: http
+    routes:
+      - name: spike-k2
+        paths: [/spike/k2]
+        protocols: [https]
+
   - name: spike-echo
     url: http://echo:8080
     routes:
