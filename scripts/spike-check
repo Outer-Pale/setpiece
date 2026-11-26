@@ -454,13 +454,17 @@ k3_run() {
   # K-3c: spike is quiet while the postgres database writes WAL; the heartbeat moves the slot.
   # lsn1 is past every spike row's commit, so the slot can pass it only by the heartbeat.
   # The slot moves when Connect flushes offsets (every 60 s by default), so allow up to 120 s.
-  for i in $(seq 24); do
-    psql_su "create table if not exists spike_wal (x int); insert into spike_wal select generate_series(1, 20000); truncate spike_wal" > /dev/null
+  # Each sample: slot position, the heartbeat row's time, and the LSN Connect has stored.
+  for i in $(seq 36); do
+    psql_su "set client_min_messages = warning; create table if not exists spike_wal (x int);
+      insert into spike_wal select generate_series(1, 20000); truncate spike_wal" > /dev/null
     sleep 5
     lsn2=$(psql_su "select confirmed_flush_lsn from pg_replication_slots where slot_name = 'cdc_spike'")
+    [ $((i % 3)) -eq 0 ] && echo "        K-3c $((i * 5))s: slot $lsn2, heartbeat $(psql_spike "select at from chassis_heartbeat" 2> /dev/null), connect offset $(connect_api GET /connectors/spike/offsets 2> /dev/null | jq -c '[.offsets[]?.offset]' 2> /dev/null)"
     [ "$i" -ge 5 ] && lsn_after "$lsn1" "$lsn2" && break
   done
   psql_su "drop table if exists spike_wal" > /dev/null
+  lsn_after "$lsn1" "$lsn2" || dc logs --since 5m connect 2>&1 | grep -iE 'warn|error|heartbeat|flush|lsn' | tail -25 | sed 's/^/        connect: /'
   check K-3c "confirmed_flush_lsn of cdc_spike passed the WAL position after the last spike row within $((i * 5)) s, heartbeat 10 s ($lsn1 -> $lsn2)" \
     lsn_after "$lsn1" "$lsn2"
 

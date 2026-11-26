@@ -42,7 +42,7 @@
   "transforms.source.value.literal": "spike",
   "transforms.spec.type": "org.apache.kafka.connect.transforms.InsertHeader",
   "transforms.spec.header": "ce_specversion",
-  "transforms.spec.value.literal": "1.0",
+  "transforms.spec.value.literal": "\"1.0\"",
   "transforms.ctype.type": "org.apache.kafka.connect.transforms.InsertHeader",
   "transforms.ctype.header": "content-type",
   "transforms.ctype.value.literal": "application/json"
