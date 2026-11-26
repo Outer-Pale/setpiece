@@ -1,0 +1,8 @@
+{
+  "name": "setpiece-spike-k5",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@platformatic/kafka": "2.19.0"
+  }
+}

@@ -79,6 +79,36 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
 
+  # One-shot: the K-5 Node 26 reader and refused writer, as svc-spike (spec K-5; §4.13).
+  # Run by spike-check k5 with `run --rm k5 <key> <ce_id> <run id>`. It installs the locked @platformatic/kafka
+  # into its tmpfs, reads the record with that key, then tries to produce.
+  k5:
+    image: node:26@sha256:f8e5d4bb28fa55c74f1345166a082a10b7c68f22304350c1ce0d18358ae94996
+    profiles: [k5]
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mkdir -p /tmp/app && cp /spike/package.json /spike/package-lock.json /spike/k5-consume.mjs /spike/k5-produce.mjs /tmp/app/
+        cd /tmp/app && npm ci --omit=dev --no-audit --no-fund --loglevel=error >&2
+        node k5-consume.mjs "$$1" "$$2" "$$3" || true
+        node k5-produce.mjs
+      - k5
+    environment:
+      HOME: /tmp
+    user: "1000:1000"
+    secrets: [kafka-svc-spike]
+    volumes:
+      - ./spike/package.json:/spike/package.json:ro
+      - ./spike/package-lock.json:/spike/package-lock.json:ro
+      - ./spike/k5-consume.mjs:/spike/k5-consume.mjs:ro
+      - ./spike/k5-produce.mjs:/spike/k5-produce.mjs:ro
+    tmpfs: [/tmp:exec]
+    networks: [services]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
   # Connect gets the K-3 connector's password file. Applying the overlay recreates connect;
   # the next base-only scripts/up recreates it back (plan issue 8).
   connect:
