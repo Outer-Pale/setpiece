@@ -21,3 +21,15 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     networks: [services]
+
+  # The upstream for Kong's K-1 test routes. Answers every request with the headers it received.
+  echo:
+    image: node:26@sha256:f8e5d4bb28fa55c74f1345166a082a10b7c68f22304350c1ce0d18358ae94996
+    command: ["node", "/app/echo.mjs"]
+    volumes:
+      - ./spike/echo.mjs:/app/echo.mjs:ro
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [services]

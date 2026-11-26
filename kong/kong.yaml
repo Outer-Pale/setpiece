@@ -1,0 +1,81 @@
+# Kong's hand-written declarative config for build step 1 (E03 spec F-1, K-1, §2a).
+# The test routes go when step 5's generator takes this file over (design checkpoint §4.10).
+# Plugin order is Kong's fixed priority order in the access phase:
+#   pre-function (1000000), then rate-limiting (910), then post-function (-1000).
+_format_version: "3.0"
+
+services:
+  - name: spike-echo
+    url: http://echo:8080
+    routes:
+      - name: spike-k1
+        paths: [/spike/k1]
+        protocols: [https]
+        plugins:
+          - &pre
+            name: pre-function
+            config:
+              access:
+                - |
+                  -- Strip what a client must never pass on (§4.6; spec K-1 (a)).
+                  kong.ctx.shared.authorization = kong.request.get_header("authorization")
+                  for _, h in ipairs({ "authorization", "cookie", "x-chassis-internal-token",
+                      "x-chassis-correlation-id", "x-chassis-budget-ms", "x-forwarded-user",
+                      "x-remote-user", "x-forwarded-for", "x-real-ip" }) do
+                    kong.service.request.clear_header(h)
+                  end
+          - name: rate-limiting
+            config: { minute: 600, policy: local, limit_by: ip }
+          - &post
+            name: post-function
+            config:
+              access:
+                - |
+                  -- Ask edge-auth, after rate-limiting (§4.6; spec K-1 (c), (d)).
+                  local http = require("resty.http")
+                  local function q(s)
+                    return '"' .. (tostring(s or ""):gsub('[%c"\\]', function(c)
+                      return string.format("\\u%04x", c:byte())
+                    end)) .. '"'
+                  end
+                  local function unavailable()
+                    return kong.response.exit(503,
+                      '{"type":"about:blank","title":"Service Unavailable","status":503}',
+                      { ["Content-Type"] = "application/problem+json" })
+                  end
+                  local auth = kong.ctx.shared.authorization
+                  local route = kong.router.get_route()
+                  local body = '{"authorization":' .. (auth and q(auth) or "null")
+                    .. ',"route":' .. q(route and route.name)
+                    .. ',"method":' .. q(kong.request.get_method())
+                    .. ',"path":' .. q(kong.request.get_path()) .. "}"
+                  local httpc = http.new()
+                  httpc:set_timeout(2000)
+                  local res, err = httpc:request_uri("http://edge-auth:8080/v1/authorize", {
+                    method = "POST", body = body,
+                    headers = { ["Content-Type"] = "application/json" },
+                  })
+                  if not res then
+                    kong.log.err("edge-auth call failed: ", err)
+                    return unavailable()
+                  end
+                  if res.status ~= 200 then
+                    return kong.response.exit(res.status, res.body,
+                      { ["Content-Type"] = res.headers["Content-Type"] or "application/problem+json" })
+                  end
+                  local token = res.headers["x-chassis-internal-token"]
+                  local cid = res.headers["x-chassis-correlation-id"]
+                  local budget = res.headers["x-chassis-budget-ms"]
+                  if not (token and cid and budget) then return unavailable() end
+                  kong.service.request.set_header("Authorization", "Bearer " .. token)
+                  kong.service.request.set_header("x-chassis-correlation-id", cid)
+                  kong.service.request.set_header("x-chassis-budget-ms", budget)
+      # The same chain with a low limit, for K-1 (b) and (e).
+      - name: spike-k1-limit
+        paths: [/spike/k1-limit]
+        protocols: [https]
+        plugins:
+          - *pre
+          - name: rate-limiting
+            config: { minute: 3, policy: local, limit_by: ip }
+          - *post

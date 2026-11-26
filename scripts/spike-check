@@ -2,9 +2,11 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1
+#        scripts/spike-check k1 --from <label> <kong address>   (K-1 (b), run on a device off the host)
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
-# shellcheck disable=SC2329
+# jq programs are single-quoted on purpose (SC2016).
+# shellcheck disable=SC2329,SC2016
 set -uo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 failed=0
@@ -109,6 +111,7 @@ section_up_order() {
   d=$(sandbox)
   fake_docker "$d/bin"
   # Nothing generated, no services yet: only the version and config calls, no up, no fga-init.
+  printf '# none\n' > "$d/platform/services.txt"
   FAKE_LOG="$d/log" FAKE_VERSION=5.5.1 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up"
   log=$(cat "$d/log")
   check A-2 "no compose.services.yaml: only compose.base.yaml is named" bash -c "! grep -q compose.services.yaml <<< '$log'"
@@ -141,7 +144,118 @@ section_static_config() {
   check K-6d "static compose checks (digests, cap_drop, restart, health check, no literal secrets)" test "$rc" -eq 0
 }
 
-[ $# -gt 0 ] || { sed -n '2,6p' "$0"; exit 2; }
+# Compose with the test overlay. COMPOSE_PROJECT_NAME, when set, picks the project.
+dc() { docker compose -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml" "$@"; }
+# A jq test over a file of JSON values, quiet.
+jqt() { jq -se "$1" "$2" > /dev/null; }
+# What the stub edge-auth recorded, read from a probe on `services`.
+stub_received() { dc run --rm --no-deps -T probe curl -s http://edge-auth:8080/_stub/received 2> /dev/null; }
+# Waits until at least 15 s are left in the minute, so a rate-limit window can't roll over mid-test.
+fresh_minute() { while [ "$((10#$(date +%S)))" -ge 45 ]; do sleep 1; done; }
+
+section_k1() {
+  local d run addr url kong img code out rec ok limited n i
+  d=$(mktemp -d)
+  if ! (cd "$repo" && scripts/up) > "$d/up.log" 2>&1 || ! dc up -d --wait echo > "$d/echo.log" 2>&1; then
+    fail K-1 "stack did not start: $(tail -3 "$d/up.log" "$d/echo.log" | tr '\n' ' ')"
+    rm -rf "$d"; return
+  fi
+  addr=$(dc port kong 8443 | grep -v '^\[' | head -1)
+  addr=${addr/0.0.0.0/127.0.0.1}
+  url="https://$addr"
+  kong=$(dc ps -q kong)
+  img=$(dc --profile probe config --format json | jq -r '.services.probe.image')
+  run="k1-$(date +%s)-$$"
+
+  # F-1: Kong answers on 443, publishes nothing else, and has no admin API.
+  code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/")
+  check F-1 "Kong answers on $url (HTTP $code)" test "$code" != 000
+  out=$(docker inspect -f '{{json .NetworkSettings.Ports}}' "$kong" |
+    jq -r '[to_entries[] | select(.value != null) | "\(.key)->\(.value[].HostPort)"] | unique | join(" ")')
+  check F-1 "published ports: $out" test "$out" = "8443/tcp->443"
+  for i in 8001 8444; do
+    code=$(docker run --rm --network "container:$kong" --user 65532 --cap-drop ALL "$img" \
+      curl -sk -m 3 -o /dev/null -w '%{http_code}' "https://127.0.0.1:$i/" 2> /dev/null)
+    check F-1 "nothing listens on admin port $i inside Kong (got ${code:-000})" test "${code:-000}" = 000
+  done
+
+  # B-5 for Kong: the key is a mounted file, and Kong serves the certificate from ./secrets.
+  check B-5 "Kong's certificate key is mounted at /run/secrets/kong-tls.key" \
+    bash -c "docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' '$kong' | grep -qw /run/secrets/kong-tls.key"
+  out=$(openssl s_client -connect "$addr" -servername localhost < /dev/null 2> /dev/null | openssl x509 -noout -fingerprint -sha256 2> /dev/null)
+  check B-5 "Kong serves secrets/kong-tls.crt (${out:-no certificate})" \
+    test -n "$out" -a "$out" = "$(openssl x509 -in "$repo/secrets/kong-tls.crt" -noout -fingerprint -sha256)"
+
+  # K-1 (a), (c), (d): a request carrying everything a client must not pass on.
+  out=$(curl -sk "$url/spike/k1" -H "Authorization: Bearer good-$run-d" -H 'Cookie: session=client' \
+    -H 'x-chassis-internal-token: forged' -H 'x-chassis-correlation-id: forged' -H 'x-chassis-budget-ms: 99999' \
+    -H 'X-Forwarded-User: mallory' -H 'X-Remote-User: mallory' -H 'X-Forwarded-For: 203.0.113.66')
+  rec=$(stub_received | jq -c --arg a "Bearer good-$run-d" '[.[] | select(.body.authorization == $a)] | last')
+  printf '%s\n%s\n' "$out" "${rec:-null}" > "$d/d.json"
+  echo "        upstream saw: $(jq -c '.headers' <<< "$out" 2> /dev/null || echo "$out")"
+  check K-1 "(a) the client's Authorization reached edge-auth through kong.ctx.shared" \
+    jqt '.[1] != null' "$d/d.json"
+  check K-1 "(c) edge-auth got exactly { authorization, route, method, path } ($(jq -c .body <<< "${rec:-null}"))" \
+    jqt '.[1].body | (keys == ["authorization","method","path","route"]) and .route == "spike-k1"
+      and .method == "GET" and .path == "/spike/k1"' "$d/d.json"
+  check K-1 "(d) upstream got Bearer <x-chassis-internal-token>, the stub's correlation id and budget" \
+    jqt '.[0].headers as $h | .[1].issued as $i
+      | $h.authorization == "Bearer \($i["x-chassis-internal-token"])"
+      and $h["x-chassis-correlation-id"] == $i["x-chassis-correlation-id"]
+      and $h["x-chassis-budget-ms"] == $i["x-chassis-budget-ms"]' "$d/d.json"
+  check K-1 "(a)(d) no Cookie, X-Forwarded-User, X-Remote-User or client x-chassis-* reached the upstream" \
+    jqt '.[0].headers | (has("cookie") or has("x-forwarded-user") or has("x-remote-user")
+      or .["x-chassis-internal-token"] == "forged" or .["x-chassis-correlation-id"] == "forged") | not' "$d/d.json"
+  check K-1 "(d) X-Forwarded-For holds only the address Kong sees ($(jq -r '.headers | "\(.["x-forwarded-for"]) / X-Real-IP \(.["x-real-ip"])"' <<< "$out" 2> /dev/null))" \
+    jqt '.[0].headers | .["x-forwarded-for"] == .["x-real-ip"] and (.["x-real-ip"] | length > 0)' "$d/d.json"
+
+  # K-1 (d): a token edge-auth refuses gives the client its status and Problem body.
+  code=$(curl -sk -o "$d/b" -w '%{http_code} %{content_type}' "$url/spike/k1" -H "Authorization: Bearer nope-$run")
+  check K-1 "(d) refused token: client gets the stub's 401 Problem ($code)" \
+    bash -c "[ '$code' = '401 application/problem+json' ] && jq -e '.status == 401' '$d/b' > /dev/null"
+  # K-1 (c): the stub waits 3 s; Kong's 2 s timeout turns the failed call into 503.
+  code=$(curl -sk -o /dev/null -w '%{http_code} %{time_total}' "$url/spike/k1" -H "Authorization: Bearer slow-$run")
+  check K-1 "(c) edge-auth slower than 2 s gives 503 (status and seconds: $code)" \
+    bash -c "set -- $code; [ \"\$1\" = 503 ] && awk -v t=\"\$2\" 'BEGIN { exit !(t >= 1.9 && t < 3) }'"
+
+  # K-1 (e), and the forged-header part of (b) from the host: the limited route allows 3 a minute.
+  fresh_minute
+  ok=0 limited=0
+  for i in 1 2 3 4 5 6; do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-$run-e")
+    case $code in 200) ok=$((ok + 1)) ;; 429) limited=$((limited + 1)) ;; esac
+  done
+  n=$(stub_received | jq --arg a "Bearer good-$run-e" '[.[] | select(.body.authorization == $a)] | length')
+  check K-1 "(e) $limited of 6 over the limit got 429; edge-auth saw ${n:-?}, the client got $ok 200s" \
+    test "$limited" -gt 0 -a "${n:--1}" -eq "$ok"
+  code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-$run-b" \
+    -H 'X-Forwarded-For: 198.51.100.7')
+  check K-1 "(b) from the host: a forged X-Forwarded-For stays in the same bucket (got $code)" test "$code" = 429
+  notrun K-1 "(b) real LAN addresses and separate buckets: needs two off-host sources (k1 --from, spec open question 5)"
+  rm -rf "$d"
+}
+
+# K-1 (b) from a device off the host. Prints the address Kong sees for this device, and checks
+# that a forged X-Forwarded-For does not move it to a fresh bucket.
+section_k1_from() {
+  local label=$1 url="https://$2" seen code i limited=0
+  seen=$(curl -sk "$url/spike/k1" -H "Authorization: Bearer good-from-$label" | jq -r '.headers["x-real-ip"]')
+  echo "        $label: Kong sees $seen. Compare with this device's own LAN address."
+  fresh_minute
+  for i in 1 2 3 4 5; do
+    code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-from-$label" \
+      -H "X-Forwarded-For: 198.51.100.$i")
+    [ "$code" = 429 ] && limited=$((limited + 1))
+  done
+  check K-1 "(b) $label: forged X-Forwarded-For values share one bucket ($limited of 5 got 429)" test "$limited" -gt 0
+  notrun K-1 "(b) separate buckets: run this on a second device within the same minute; it should get 200s"
+}
+
+[ $# -gt 0 ] || { sed -n '2,7p' "$0"; exit 2; }
+if [ "$1" = k1 ] && [ "${2:-}" = --from ]; then
+  [ $# -eq 4 ] || { echo "usage: scripts/spike-check k1 --from <label> <kong address>" >&2; exit 2; }
+  echo "== k1 --from $3"; section_k1_from "$3" "$4"; exit "$failed"
+fi
 for s in "$@"; do
   fn="section_${s//-/_}"
   if declare -F "$fn" > /dev/null; then echo "== $s"; "$fn"; else echo "unknown section: $s" >&2; exit 2; fi
