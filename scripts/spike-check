@@ -238,11 +238,14 @@ section_telemetry() {
 
   # I-2: a container started while the Collector is stopped still starts, and its lines arrive later.
   m="spike-marker-$(date +%s)-$RANDOM"
+  # Never leave the Collector stopped: unless-stopped would keep it down, and logs would be dropped.
+  trap 'dc start otel-collector > /dev/null 2>&1' EXIT INT TERM
   dc stop otel-collector > /dev/null 2>&1
   c=$(dc run -d --rm stand-in sh -c "echo $m; exec sleep 600" 2> /dev/null)
   t=$(docker inspect -f '{{.State.Status}}' "$c" 2> /dev/null)
   check I-2 "stand-in started while otel-collector was stopped (state: ${t:-not created})" test "$t" = running
   dc start otel-collector > /dev/null 2>&1
+  trap - EXIT INT TERM
   if secs=$(wait_loki "$m" 180); then
     pass I-2 "the stand-in's marker reached Loki ${secs}s after the Collector came back"
   else
@@ -290,7 +293,9 @@ section_telemetry() {
   local gp=${t##*:}; gp=${gp%% *}
   t=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$gp/api/org")
   check I-4 "anonymous GET /api/org is refused (HTTP $t)" test "$t" = 401
-  t=$(curl -s -o /dev/null -w '%{http_code}' -u "admin:$(cat "$repo/secrets/grafana-admin")" "http://127.0.0.1:$gp/api/org")
+  # The password goes to curl on stdin, not in its argv where `ps` would show it.
+  t=$(printf 'user = "admin:%s"\n' "$(cat "$repo/secrets/grafana-admin")" |
+    curl -s -K - -o /dev/null -w '%{http_code}' "http://127.0.0.1:$gp/api/org")
   check I-4 "admin with the password in secrets/grafana-admin is accepted (HTTP $t)" test "$t" = 200
   t=$(curl -s -o /dev/null -w '%{http_code}' -u admin:admin "http://127.0.0.1:$gp/api/org")
   check I-4 "the image's default admin:admin is refused (HTTP $t)" test "$t" = 401

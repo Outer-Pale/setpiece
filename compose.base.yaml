@@ -32,7 +32,8 @@ networks:
 services:
   # Receives OTLP and fluent-forward and sends to otel-lgtm (spec I-1). Its config file is
   # its only mount. The image has no shell or HTTP client, so the health check runs the
-  # Collector's own binary (spec A-8).
+  # Collector's own binary (spec A-8): `validate` proves the binary runs and the config parses,
+  # not that pipelines are live; spike-check telemetry proves those.
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.166.0@sha256:3e18fe04181de50bdd72e23ad4a4d6214b54351e63d496f1c58127cc4541ad7f
     user: "10001:10001"
@@ -78,7 +79,9 @@ services:
 
   # Grafana, Loki, Tempo and Prometheus in one container, behind the Collector (R-9; §4.9).
   # Metrics kept 35 days, logs and traces 7 days, on a named volume (spec I-3). Grafana only on
-  # 127.0.0.1, anonymous login off, admin password from a secret file (spec I-4).
+  # 127.0.0.1, anonymous login off, admin password from a secret file (spec I-4). Grafana applies
+  # the password only when it creates its database on the volume; to rotate it, reset the volume
+  # or run `grafana cli admin reset-admin-password` in the container.
   otel-lgtm:
     image: grafana/otel-lgtm:0.41.1@sha256:1b852b77d7bcadb7699bfe7c78a51d059dff85168de674728cf7abf4474645e5
     cap_drop: [ALL]

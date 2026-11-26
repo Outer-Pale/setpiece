@@ -8,7 +8,9 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
-  # Published on the host as 127.0.0.1:24224 only, for the daemon's fluentd driver.
+  # Published on the host as 127.0.0.1:24224 only, for the daemon's fluentd driver. Inside the
+  # container it listens on all addresses, so any container on services or ops can send forward
+  # records without authentication (the protocol has none here). Accepted for step 1.
   fluentforward:
     endpoint: 0.0.0.0:24224
 
