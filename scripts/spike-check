@@ -172,9 +172,10 @@ section_k4() {
   if ! "${dc[@]}" exec -T keycloak bash -c '
       pw=$(cat); c=$(mktemp)
       kc=/opt/keycloak/bin/kcadm.sh
-      "$kc" config credentials --config "$c" --server http://127.0.0.1:8080 --realm master \
-        --user admin --password "$(< /run/secrets/keycloak-admin)" &&
-      "$kc" set-password --config "$c" -r setpiece --username spike-user --new-password "$pw"
+      # Passwords through KC_CLI_PASSWORD, never on a command line the host can read with ps.
+      KC_CLI_PASSWORD=$(< /run/secrets/keycloak-admin) "$kc" config credentials --config "$c" \
+        --server http://127.0.0.1:8080 --realm master --user admin &&
+      KC_CLI_PASSWORD=$pw "$kc" set-password --config "$c" -r setpiece --username spike-user
       rc=$?; rm -f "$c"; exit $rc' < "$d/pw" > "$d/kcadm.log" 2>&1; then
     fail E-1 "kcadm.sh could not set the test user's password: $(tail -1 "$d/kcadm.log")"
     rm -rf "$d"; return

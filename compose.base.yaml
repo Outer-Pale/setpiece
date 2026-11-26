@@ -36,6 +36,8 @@ services:
       - ./keycloak/start.sh:/opt/setpiece/start.sh:ro
       - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
     secrets: [keycloak-db, keycloak-admin]
+    # Holds the config file keycloak/start.sh writes; never on disk.
+    tmpfs: ["/run/keycloak:mode=0700,uid=1000,gid=0"]
     depends_on:
       pg-init:
         condition: service_completed_successfully

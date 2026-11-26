@@ -2,7 +2,7 @@
   "realm": "setpiece",
   "enabled": true,
   "organizationsEnabled": true,
-  "sslRequired": "none",
+  "sslRequired": "external",
   "registrationAllowed": false,
   "defaultDefaultClientScopes": [
     "basic",
@@ -108,7 +108,7 @@
         }
       ],
       "optionalClientScopes": [],
-      "description": "Build step 1's hand-written edge client (E03 spec E-1). Direct access grants are on only so spike-check k4 can sign the test user in; build step 5's keycloak-init owns the real client."
+      "description": "Build step 1's hand-written edge client (E03 spec E-1). Direct access grants are on only so spike-check k4 can sign the test user in; build step 5's keycloak-init owns the real client. keycloak-init must turn directAccessGrantsEnabled off."
     }
   ],
   "users": [
@@ -146,5 +146,6 @@
       ]
     }
   ],
-  "defaultOptionalClientScopes": []
+  "defaultOptionalClientScopes": [],
+  "bruteForceProtected": true
 }
