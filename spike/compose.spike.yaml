@@ -1,0 +1,12 @@
+# Test-only overlay for build step 1's checks (spec §2a). Never loaded by scripts/up.
+# Used as: docker compose -f compose.base.yaml -f spike/compose.spike.yaml ...
+services:
+  # A long-running container on `services` that the checks probe from (K-5b, I-2, B-5, K-6).
+  stand-in:
+    image: busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
+    command: ["sleep", "infinity"]
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [services]
