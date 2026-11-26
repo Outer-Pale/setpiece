@@ -1,0 +1,20 @@
+# The hand-written base platform (design checkpoint §4.10). Off-the-shelf containers arrive
+# issue by issue in build step 1 (E03). Every container: image by digest, cap_drop ALL with a
+# commented cap_add list, restart unless-stopped, a health check, secrets as files only.
+name: setpiece
+
+networks:
+  # §4.12. Kong (443) is the only port published to the outside.
+  edge: {}
+  # Keycloak and what talks to it. No route out of the host (§4.12b).
+  idp:
+    internal: true
+  # Kong, edge-auth, chassis services, OpenFGA, Postgres, Kafka, the OTLP Collector.
+  services: {}
+  # Only Postgres, Kafka, Kafka Connect, each <svc>-connector and kafka-init (§4.12).
+  data:
+    internal: true
+  # The Collectors, Kong's status listener and otel-lgtm.
+  ops: {}
+
+services: {}

@@ -11,6 +11,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: |
-          files=$(git ls-files 'scripts/*' '*.sh')
-          if [ -n "$files" ]; then shellcheck $files; else echo "no shell scripts yet"; fi
+        run: shellcheck scripts/*
+      - name: Compose files parse
+        run: docker compose -f compose.base.yaml -f spike/compose.spike.yaml config -q
+      - name: spike-check (sections that need no running stack)
+        run: scripts/spike-check secrets up-version up-order static-config

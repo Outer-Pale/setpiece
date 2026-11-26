@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Build step 1's checks (E03 spec, requirement Q-1). Each section prints
+# PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
+# exits non-zero if any check failed.
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config
+# Functions are called indirectly through section_<name>, which shellcheck cannot see.
+# shellcheck disable=SC2329
+set -uo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+failed=0
+
+pass()   { printf 'PASS    %-5s %s\n' "$1" "$2"; }
+fail()   { printf 'FAIL    %-5s %s\n' "$1" "$2"; failed=1; }
+notrun() { printf 'NOT RUN %-5s %s\n' "$1" "$2"; }
+check()  { local id=$1 what=$2; shift 2; if "$@"; then pass "$id" "$what"; else fail "$id" "$what"; fi; }
+
+# A throwaway copy of the scripts and platform list, so checks never touch ./secrets.
+sandbox() {
+  local d
+  d=$(mktemp -d)
+  mkdir -p "$d/scripts" "$d/platform"
+  cp "$repo/scripts/secrets-init" "$repo/scripts/up" "$d/scripts/"
+  cp "$repo/platform/secrets.base.yaml" "$repo/platform/services.txt" "$d/platform/"
+  cp "$repo/compose.base.yaml" "$d/"
+  echo "$d"
+}
+
+# Names of base secret files, by kind.
+entries() { sed -E 's/#.*//' "$repo/platform/secrets.base.yaml" | grep -E ':' | sed -E 's/[[:space:]]//g'; }
+files_of() { entries | awk -F: -v k="$1" '$2 == k { print $1 }'; }
+
+section_secrets() {
+  local d h1 h2 f bad
+  d=$(sandbox)
+  "$d/scripts/secrets-init" "$d"
+  h1=$(cd "$d/secrets" && sha256sum ./* | sort)
+  "$d/scripts/secrets-init" "$d"
+  h2=$(cd "$d/secrets" && sha256sum ./* | sort)
+
+  bad=""
+  for f in $(files_of password) $(files_of pem-key); do [ -f "$d/secrets/$f" ] || bad+=" $f"; done
+  for f in $(files_of certificate); do [ -f "$d/secrets/$f.crt" ] && [ -f "$d/secrets/$f.key" ] || bad+=" $f"; done
+  check B-1 "every base secret written (missing:${bad:- none})" test -z "$bad"
+  check B-1 "second run changes no file" test "$h1" = "$h2"
+  check B-1 "generated/fga.env exists and is empty" test -f "$d/generated/fga.env" -a ! -s "$d/generated/fga.env"
+  check B-1 "./secrets is git-ignored" git -C "$repo" check-ignore -q secrets/x
+
+  bad=""
+  for f in "$d"/secrets/*; do
+    [ "$(tail -c1 "$f" | od -An -c | tr -d ' ')" = '\n' ] && bad+=" ${f##*/}"
+  done
+  check B-2 "no secret file ends in a newline (offenders:${bad:- none})" test -z "$bad"
+  bad=""
+  for f in $(files_of password); do grep -Eqx '[A-Za-z0-9]{32}' "$d/secrets/$f" || bad+=" $f"; done
+  check B-2 "passwords are 32 alphanumeric characters (offenders:${bad:- none})" test -z "$bad"
+  bad=""
+  for f in $(files_of pem-key); do
+    openssl pkey -in "$d/secrets/$f" -noout -text 2> /dev/null | grep -q ED25519 &&
+      head -1 "$d/secrets/$f" | grep -q 'BEGIN PRIVATE KEY' || bad+=" $f"
+  done
+  check B-2 "pem-key files are Ed25519 PKCS#8 (offenders:${bad:- none})" test -z "$bad"
+
+  for f in $(files_of certificate); do
+    check B-3 "$f.crt subject: $(openssl x509 -in "$d/secrets/$f.crt" -noout -subject 2> /dev/null)" \
+      bash -c "openssl x509 -in '$d/secrets/$f.crt' -noout -subject | grep -q self-signed"
+  done
+
+  check B-4 "./secrets is 0700 ($(stat -c %a "$d/secrets"))" test "$(stat -c %a "$d/secrets")" = 700
+  bad=""
+  for f in "$d"/secrets/*; do [ "$(stat -c %a "$f")" = 444 ] || bad+=" ${f##*/}"; done
+  check B-4 "every secret file is 0444 (offenders:${bad:- none})" test -z "$bad"
+  notrun B-4 "per-container secret mounts: checked as containers arrive (issue OUT-155)"
+  rm -rf "$d"
+}
+
+# A fake `docker` that records its arguments. FAKE_VERSION and FAKE_SERVICES set its answers.
+fake_docker() {
+  local bin=$1
+  mkdir -p "$bin"
+  cat > "$bin/docker" << 'EOF'
+#!/usr/bin/env bash
+if [ -e secrets/kafka-admin ]; then sec=y; else sec=n; fi
+echo "docker $* [secrets=$sec]" >> "$FAKE_LOG"
+case " $* " in
+  *" version --short "*) echo "$FAKE_VERSION" ;;
+  *" config --services "*) printf '%s\n' $FAKE_SERVICES ;;
+esac
+EOF
+  chmod +x "$bin/docker"
+}
+
+section_up_version() {
+  local d rc
+  d=$(sandbox)
+  fake_docker "$d/bin"
+  FAKE_LOG="$d/log" FAKE_VERSION=9.9.9 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
+  rc=$?
+  check A-5 "refuses Compose 9.9.9 (exit $rc: $(cat "$d/err"))" test "$rc" -ne 0
+  check A-5 "nothing started: no secrets written, no up call" \
+    bash -c "[ ! -e '$d/secrets' ] && ! grep -q ' up ' '$d/log'"
+  FAKE_LOG="$d/log2" FAKE_VERSION=v5.5.1 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up" 2> "$d/err"
+  rc=$?
+  check A-5 "accepts the pinned version (exit $rc)" test "$rc" -eq 0 -a -f "$d/secrets/kafka-admin"
+  rm -rf "$d"
+}
+
+section_up_order() {
+  local d log
+  d=$(sandbox)
+  fake_docker "$d/bin"
+  # Nothing generated, no services yet: only the version and config calls, no up, no fga-init.
+  FAKE_LOG="$d/log" FAKE_VERSION=5.5.1 FAKE_SERVICES="" PATH="$d/bin:$PATH" "$d/scripts/up"
+  log=$(cat "$d/log")
+  check A-2 "no compose.services.yaml: only compose.base.yaml is named" bash -c "! grep -q compose.services.yaml <<< '$log'"
+  check A-2 "no fga/fga.mod: fga-init not run" bash -c "! grep -q fga-init <<< '$log'"
+  check A-3 "empty services list and no postgres/openfga: no up call" bash -c "! grep -q ' up ' <<< '$log'"
+
+  # With a stand-in list: step 2 names only postgres and openfga, step 3 names the list, in that order.
+  printf 'kong\nedge-auth\n' > "$d/platform/services.txt"
+  FAKE_LOG="$d/log2" FAKE_VERSION=5.5.1 FAKE_SERVICES="postgres openfga pg-init kong edge-auth" \
+    PATH="$d/bin:$PATH" "$d/scripts/up"
+  log=$(grep ' up ' "$d/log2" | sed 's/ \[secrets=.\]$//')
+  local first_up
+  first_up=$(grep -m1 ' up ' "$d/log2")
+  echo "        calls: $(tr '\n' ';' <<< "$log")"
+  check A-3 "step 2 waits on postgres and openfga only, base file only" \
+    bash -c "sed -n 1p <<< '$log' | grep -qx 'docker compose -f compose.base.yaml up -d --wait postgres openfga'"
+  check A-3 "step 3 waits on platform/services.txt" \
+    bash -c "sed -n 2p <<< '$log' | grep -qx 'docker compose -f compose.base.yaml up -d --wait kong edge-auth'"
+  check A-3 "no one-shot container after --wait" \
+    bash -c "! grep -Eq -- '--wait.*(pg-init|kafka-init|openfga-migrate|fga-init)' <<< '$log'"
+  check A-3 "secrets-init ran before the first up ($first_up)" bash -c "grep -q 'secrets=y\]$' <<< '$first_up'"
+  rm -rf "$d"
+}
+
+section_static_config() {
+  local out
+  out=$("$repo/scripts/check-compose" 2>&1)
+  local rc=$?
+  printf '%s\n' "$out" | sed 's/^/        /'
+  check K-6d "static compose checks (digests, cap_drop, restart, health check, no literal secrets)" test "$rc" -eq 0
+}
+
+[ $# -gt 0 ] || { sed -n '2,6p' "$0"; exit 2; }
+for s in "$@"; do
+  fn="section_${s//-/_}"
+  if declare -F "$fn" > /dev/null; then echo "== $s"; "$fn"; else echo "unknown section: $s" >&2; exit 2; fi
+done
+exit "$failed"
