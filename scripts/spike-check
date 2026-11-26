@@ -525,13 +525,15 @@ section_telemetry() {
   # Never leave the Collector stopped: unless-stopped would keep it down, and logs would be dropped.
   trap 'dc start otel-collector > /dev/null 2>&1' EXIT INT TERM
   dc stop otel-collector > /dev/null 2>&1
-  c=$(dc run -d --rm stand-in sh -c "echo $m; exec sleep 600" 2> /dev/null)
+  # Five marker lines, all printed while the Collector is down, so one lost write can't decide it.
+  c=$(dc run -d --rm stand-in sh -c "for i in 1 2 3 4 5; do echo $m-\$i; sleep 1; done; exec sleep 600" 2> /dev/null)
   t=$(docker inspect -f '{{.State.Status}}' "$c" 2> /dev/null)
   check I-2 "stand-in started while otel-collector was stopped (state: ${t:-not created})" test "$t" = running
+  sleep 6
   dc start otel-collector > /dev/null 2>&1
   trap - EXIT INT TERM
   if secs=$(wait_loki "$m" 180); then
-    pass I-2 "the stand-in's marker reached Loki ${secs}s after the Collector came back"
+    pass I-2 "the stand-in's marker reached Loki ${secs}s after the Collector came back ($(loki_count "$m") of 5 lines)"
   else
     fail I-2 "the stand-in's marker was not in Loki 180s after the Collector came back"
   fi
