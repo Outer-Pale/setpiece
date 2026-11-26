@@ -2,7 +2,7 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 pg k4
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg k4
 #        scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>   (K-1 (b), off the host)
 # Sections that need the running stack use the Compose project in COMPOSE_PROJECT_NAME, if set.
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
@@ -261,6 +261,68 @@ section_k1_from() {
   check K-1 "(b) $label: forged X-Forwarded-For values share one bucket ($limited of 5 got 429)" test "$limited" -gt 0
   notrun K-1 "(b) separate buckets: run this on a second device within the same minute; it should get 200s"
 }
+
+# Which target answers each of 20 requests through Kong's K-2 route, as
+# "a=<n> b=<n> 5xx=<n> other=<n>"; other is anything else, such as a curl failure.
+k2_count() {
+  local i body a=0 b=0 bad=0 other=0
+  for i in $(seq 20); do
+    body=$(curl -sk -w ' %{http_code}' "$1/spike/k2")
+    case $body in
+      "target-a 200") a=$((a + 1)) ;;
+      "target-b 200") b=$((b + 1)) ;;
+      *" 5"??) bad=$((bad + 1)) ;;
+      *) other=$((other + 1)) ;;
+    esac
+  done
+  echo "a=$a b=$b 5xx=$bad other=$other"
+}
+k2_flip() {
+  dc run --rm --no-deps -T probe curl -sf -X POST "http://$1:8080/_spike/$2" > /dev/null 2>&1 ||
+    fail K-2 "could not flip $1 $2"
+}
+# Both targets answer, nothing failed.
+k2_both='^a=[1-9][0-9]*\ b=[1-9][0-9]*\ 5xx=0\ other=0$'
+
+section_k2() {
+  local d addr url seen i
+  d=$(mktemp -d)
+  if ! (cd "$repo" && scripts/up) > "$d/up.log" 2>&1 || ! dc up -d --wait target-a target-b > "$d/t.log" 2>&1; then
+    fail K-2 "stack did not start: $(tail -3 "$d/up.log" "$d/t.log" | tr '\n' ' ')"
+    rm -rf "$d"; return
+  fi
+  rm -rf "$d"
+  addr=$(dc port kong 8443 | grep -v '^\[' | head -1)
+  url="https://${addr/0.0.0.0/127.0.0.1}"
+  k2_flip target-a ready/1; k2_flip target-a fail/0; k2_flip target-b ready/1; k2_flip target-b fail/0
+  # Kong may have started before the targets existed; give its DNS and checks up to 60 s.
+  for i in $(seq 30); do
+    seen=$(k2_count "$url")
+    [[ $seen =~ $k2_both ]] && break
+    sleep 2
+  done
+  check K-2 "both targets serve at the start ($seen)" bash -c "[[ '$seen' =~ $k2_both ]]"
+
+  # Active: target-a fails /readyz, so Kong takes it out; it comes back once /readyz passes.
+  k2_flip target-a ready/0; sleep 4
+  seen=$(k2_count "$url")
+  check K-2 "active: target-a failing /readyz gets no traffic ($seen)" test "$seen" = "a=0 b=20 5xx=0 other=0"
+  k2_flip target-a ready/1; sleep 8
+  seen=$(k2_count "$url")
+  check K-2 "active: target-a back after /readyz passes ($seen)" bash -c "[[ '$seen' =~ $k2_both ]]"
+
+  # Passive: target-a answers 500 while /readyz still passes; Kong takes it out after 2. An active
+  # probe on the 5 s cadence can bring it back once mid-burst, hence up to 6.
+  k2_flip target-a fail/1
+  seen=$(k2_count "$url")
+  check K-2 "passive: target-a answering 500 leaves rotation after a few ($seen)" \
+    bash -c "[[ '$seen' =~ ^a=0\ b=[0-9]+\ 5xx=([0-9]+)\ other=0$ ]] && [ \"\${BASH_REMATCH[1]}\" -ge 1 ] && [ \"\${BASH_REMATCH[1]}\" -le 6 ]"
+  k2_flip target-a fail/0; sleep 8
+  seen=$(k2_count "$url")
+  check K-2 "passive: target-a back once it answers again ($seen)" bash -c "[[ '$seen' =~ $k2_both ]]"
+}
+
+[ $# -gt 0 ] || { sed -n '2,7p' "$0"; exit 2; }
 
 psql_su() { dc exec -T -u postgres postgres psql -X -At -v ON_ERROR_STOP=1 -d postgres -c "$1"; }
 cid() { dc ps -a -q "$1"; }
