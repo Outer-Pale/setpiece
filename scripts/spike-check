@@ -2,7 +2,7 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg kafka k3 k4 k5 telemetry
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg kafka k3 k4 k5 telemetry static net
 #        scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>   (K-1 (b), off the host)
 # Sections that need the running stack use the Compose project in COMPOSE_PROJECT_NAME, if set.
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
@@ -699,6 +699,97 @@ section_k5() {
   check K-5 "the Produce request as svc-spike is refused with TOPIC_AUTHORIZATION_FAILED, not a network or sign-in error" \
     jqin '.produced == false and (.errors | any(test("Produce\\(v"))) and (.errors | any(test("\\[TOPIC_AUTHORIZATION_FAILED\\]"))) and (.errors | any(test("AUTHENTICATION|NETWORK")) | not)' <<< "${prod:-null}"
   check K-5 "no record with the produce's key reached ev.spike.example" no_record k5-should-not-land k5-should-not-land
+}
+
+# Base containers of the project, running or exited, as "service<TAB>container id" lines.
+base_containers() {
+  local svc
+  for svc in $(docker compose -f "$repo/compose.base.yaml" --profile "*" config --services); do
+    dc ps -a -q "$svc" 2> /dev/null | sed "s/^/$svc\t/"
+  done
+}
+# The uncommented lines of an expected-value file.
+expected() { sed -E 's/#.*//; /^[[:space:]]*$/d' "$repo/spike/expected/$1"; }
+
+# Checks on the running stack (plan issue 10): A-4, A-7, A-8, K-6d, B-6 and B-5's non-root read.
+section_static() {
+  local want have bad c svc v f n img
+  if ! (cd "$repo" && scripts/up) > /dev/null 2>&1; then fail A-4 "scripts/up failed"; return; fi
+  # A-4: services.txt is the base file's services minus its one-shots.
+  want=$(docker compose -f "$repo/compose.base.yaml" --profile "*" config --services | grep -vxF -f <(expected one-shots.txt) | sort)
+  have=$(expected ../../platform/services.txt | sort)
+  check A-4 "platform/services.txt equals the base services minus one-shots (diff: $(diff <(echo "$want") <(echo "$have") | grep '^[<>]' | tr '\n' ' '))" \
+    test "$want" = "$have"
+  # A-7, A-8: each long-running container restarts unless stopped, has a health check and is healthy.
+  bad=""
+  for svc in $have; do
+    c=$(dc ps -q "$svc" 2> /dev/null | head -1)
+    if [ -z "$c" ]; then bad+=" $svc:not-running"; continue; fi
+    [ "$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c")" = unless-stopped ] || bad+=" $svc:restart"
+  done
+  check A-7 "every long-running container has restart unless-stopped (offenders:${bad:- none})" test -z "$bad"
+  bad=""
+  for svc in $have; do
+    c=$(dc ps -q "$svc" 2> /dev/null | head -1)
+    [ -n "$c" ] || { bad+=" $svc:not-running"; continue; }
+    v=$(docker inspect -f '{{if .Config.Healthcheck}}{{.State.Health.Status}}{{else}}none{{end}}' "$c")
+    [ "$v" = healthy ] || bad+=" $svc:$v"
+  done
+  check A-8 "every long-running container has a health check and is healthy (offenders:${bad:- none})" test -z "$bad"
+  # K-6d: every image of the base containers, as configured and as running, is pinned by digest.
+  bad=$(docker compose -f "$repo/compose.base.yaml" --profile "*" config --images | grep -v '@sha256:[0-9a-f]\{64\}$' | tr '\n' ' ')
+  while IFS=$'\t' read -r svc c; do
+    img=$(docker inspect -f '{{.Config.Image}}' "$c")
+    [[ $img =~ @sha256:[0-9a-f]{64}$ ]] || bad+=" $svc:$img"
+  done < <(base_containers)
+  check K-6d "every base image is pinned by digest, in config and in the containers (offenders: ${bad:-none})" test -z "${bad// /}"
+  # B-6: no secret file's value in any base container's Env, Cmd, Entrypoint or Healthcheck,
+  # running or exited, one-shots included.
+  bad="" n=0
+  while IFS=$'\t' read -r svc c; do
+    n=$((n + 1))
+    v=$(docker inspect -f '{{json .Config.Env}}{{json .Config.Cmd}}{{json .Config.Entrypoint}}{{json .Config.Healthcheck}}' "$c")
+    for f in "$repo"/secrets/*; do
+      [ -s "$f" ] || continue
+      grep -qF -- "$(cat "$f")" <<< "$v" && bad+=" $svc:${f##*/}"
+    done
+  done < <(base_containers)
+  check B-6 "no secret value in Env, Cmd, Entrypoint or Healthcheck of $n base containers (leaks:${bad:- none})" \
+    test -z "$bad" -a "$n" -gt 0
+  # B-5: a non-root container (uid 65532, the stand-in's image) can read every secret file mounted.
+  img=$(dc config --format json | jq -r '.services["stand-in"].image')
+  out=$(docker run --rm --user 65532:65532 --read-only --cap-drop ALL --network none \
+    -v "$repo/secrets:/run/secrets:ro" "$img" sh -c 'n=0; for f in /run/secrets/*; do [ -f "$f" ] || continue; n=$((n+1)); cat "$f" > /dev/null || echo "unreadable ${f##*/}"; done; echo "files $n"' 2>&1)
+  check B-5 "uid 65532 reads every mounted secret file ($(tr '\n' ' ' <<< "$out"))" \
+    bash -c '[[ $1 =~ files\ ([1-9][0-9]*) ]] && ! grep -q unreadable <<< "$1"' _ "$out"
+}
+
+# J-1: each base container's networks against spike/expected/networks.txt, before the overlay is
+# applied, and the internal flags of idp and data.
+section_net() {
+  local svc nets got want bad net internal want_int c rows
+  if ! (cd "$repo" && scripts/up) > /dev/null 2>&1; then fail J-1 "scripts/up failed"; return; fi
+  rows=$(base_containers)
+  bad=""
+  while read -r svc nets; do
+    c=$(awk -F'\t' -v s="$svc" '$1 == s { print $2; exit }' <<< "$rows")
+    if [ -z "$c" ]; then bad+=" $svc:no-container"; continue; fi
+    got=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$c" |
+      tr ' ' '\n' | sed -E '/^$/d; s/^.*_//' | sort | tr '\n' ' ')
+    want=$(tr ' ' '\n' <<< "$nets" | sed '/^$/d' | sort | tr '\n' ' ')
+    [ "$got" = "$want" ] || bad+=" $svc:[$got] want [$want]"
+  done < <(expected networks.txt)
+  check J-1 "every base container is on exactly its §4.12 networks (offenders:${bad:- none})" test -z "$bad"
+  # Every base service must be in the table, so a new container can't skip J-1.
+  bad=$(docker compose -f "$repo/compose.base.yaml" --profile "*" config --services | grep -vxF -f <(expected networks.txt | awk '{ print $1 }') | tr '\n' ' ')
+  check J-1 "the expected table covers every base service (missing: ${bad:-none})" test -z "$bad"
+  bad=""
+  for net in edge idp services data ops; do
+    internal=$(docker network inspect -f '{{.Internal}}' "$(dc config --format json | jq -r --arg n "$net" '.networks[$n].name')" 2> /dev/null)
+    case $net in idp | data) want_int=true ;; *) want_int=false ;; esac
+    [ "$internal" = "$want_int" ] || bad+=" $net:${internal:-missing}"
+  done
+  check J-1 "the five networks exist; idp and data are internal, the others not (offenders:${bad:- none})" test -z "$bad"
 }
 
 section_telemetry() {

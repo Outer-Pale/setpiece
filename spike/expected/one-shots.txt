@@ -1,0 +1,6 @@
+# One-shot containers of compose.base.yaml: they run to completion and are never waited on (§4.10).
+# A-4 subtracts these from `docker compose config --services`; everything else must be in
+# platform/services.txt.
+kafka-init
+openfga-migrate
+pg-init
