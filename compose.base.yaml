@@ -169,6 +169,69 @@ services:
       start_period: 5s
     networks: [services, idp]
 
+  # Kafka, one combined KRaft node (§4.10; M0007; spec D-1). kafka/start.sh replaces the
+  # image's command and reads the passwords from /run/secrets at run time.
+  kafka:
+    image: apache/kafka:4.4.0@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
+    entrypoint: ["/bin/bash", "/opt/setpiece/start.sh"]
+    environment:
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - ./kafka:/opt/setpiece:ro
+      - kafka-data:/var/lib/kafka/data
+    secrets: [kafka-admin, kafka-connect, kafka-connect-producer]
+    networks: [services, data]
+    restart: unless-stopped
+    cap_drop: [ALL]
+    # cap_add: none. Runs as the image's appuser (uid 1000) and binds only 9092 and 9093.
+    healthcheck:
+      # A small heap for the check's own JVM, which would otherwise take the broker's 512 MB.
+      test: ["CMD-SHELL", "KAFKA_HEAP_OPTS=-Xmx128m /opt/kafka/bin/kafka-broker-api-versions.sh
+             --bootstrap-server localhost:9092 --command-config /tmp/kafka/admin.properties > /dev/null"]
+      interval: 15s
+      timeout: 30s
+      retries: 10
+      start_period: 60s
+
+  # One-shot: users, topics and ACLs, as admin, from the same image (§4.10; spec D-2).
+  kafka-init:
+    image: apache/kafka:4.4.0@sha256:833b867a9585a141da455dc2b57431c65cbccb27f11c91f694444cca9f777e0f
+    entrypoint: ["/bin/bash", "/opt/setpiece/init.sh"]
+    volumes:
+      - ./kafka:/opt/setpiece:ro
+    secrets: [kafka-admin, kafka-connect, kafka-connect-producer, kafka-svc-collector, kafka-svc-spike]
+    networks: [data]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    cap_drop: [ALL]
+    # cap_add: none. Runs as appuser and only opens client connections.
+
+  # Kafka Connect with Debezium (§4.10; spec D-4). On data only: its REST API is
+  # unauthenticated, so no service can reach it (§4.12).
+  connect:
+    image: quay.io/debezium/connect:3.7@sha256:b201d71ac09a2e9c52cbe9e4079cc1e6fd48d5158d9f662f172208a9f6da2f4c
+    entrypoint: ["/kafka/bin/connect-distributed.sh", "/opt/setpiece/worker.properties"]
+    environment:
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+      KAFKA_LOG4J_OPTS: "-Dlog4j2.configurationFile=/kafka/config.orig/connect-log4j2.yaml"
+    volumes:
+      - ./connect/worker.properties:/opt/setpiece/worker.properties:ro
+    secrets: [kafka-connect, kafka-connect-producer]
+    networks: [data]
+    depends_on:
+      # P-1, the step 1 half (spec D-3).
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    cap_drop: [ALL]
+    # cap_add: none. Runs as the image's kafka user (uid 1001) and binds only 8083.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
   # Keycloak (M0014), on its own database from pg-init (spec C-2, E-1). On `idp` only (§4.12;
   # punch list P-6). Its passwords come from mounted files through keycloak/start.sh (B-5, B-6).
   keycloak:
@@ -215,6 +278,7 @@ services:
 
 volumes:
   postgres-data: {}
+  kafka-data: {}
 
 # Each container mounts only the files it declares (§4.12b). scripts/secrets-init writes them.
 secrets:
@@ -234,3 +298,13 @@ secrets:
     file: ./secrets/kong-tls.crt
   kong-tls.key:
     file: ./secrets/kong-tls.key
+  kafka-admin:
+    file: ./secrets/kafka-admin
+  kafka-connect:
+    file: ./secrets/kafka-connect
+  kafka-connect-producer:
+    file: ./secrets/kafka-connect-producer
+  kafka-svc-collector:
+    file: ./secrets/kafka-svc-collector
+  kafka-svc-spike:
+    file: ./secrets/kafka-svc-spike

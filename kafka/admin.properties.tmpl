@@ -1,0 +1,5 @@
+# The admin client config for the health check and kafka-init (§4.10; spec D-1, D-2).
+# Rendered into /tmp with the password from /run/secrets/kafka-admin.
+security.protocol=SASL_PLAINTEXT
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="admin" password="@ADMIN_PASSWORD@";

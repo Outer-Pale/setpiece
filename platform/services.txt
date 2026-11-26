@@ -4,4 +4,6 @@ postgres
 openfga
 kong
 edge-auth
+kafka
+connect
 keycloak

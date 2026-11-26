@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck scripts/* pg/*.sh
+        run: shellcheck scripts/* pg/*.sh kafka/*.sh
       - name: Compose files parse
         run: docker compose -f compose.base.yaml -f spike/compose.spike.yaml config -q
       - name: spike-check (sections that need no running stack)
