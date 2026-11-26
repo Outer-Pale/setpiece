@@ -3,7 +3,7 @@
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
 # Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1
-#        scripts/spike-check k1 --from <label> <kong address>   (K-1 (b), run on a device off the host)
+#        scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>   (K-1 (b), off the host)
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
 # jq programs are single-quoted on purpose (SC2016).
 # shellcheck disable=SC2329,SC2016
@@ -150,8 +150,8 @@ dc() { docker compose -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike
 jqt() { jq -se "$1" "$2" > /dev/null; }
 # What the stub edge-auth recorded, read from a probe on `services`.
 stub_received() { dc run --rm --no-deps -T probe curl -s http://edge-auth:8080/_stub/received 2> /dev/null; }
-# Waits until at least 15 s are left in the minute, so a rate-limit window can't roll over mid-test.
-fresh_minute() { while [ "$((10#$(date +%S)))" -ge 45 ]; do sleep 1; done; }
+# Waits for the start of a new minute, so a rate-limit window is fresh and can't roll over mid-test.
+fresh_minute() { sleep $((61 - 10#$(date +%S))); }
 
 section_k1() {
   local d run addr url kong img code out rec ok limited n i
@@ -173,10 +173,14 @@ section_k1() {
   out=$(docker inspect -f '{{json .NetworkSettings.Ports}}' "$kong" |
     jq -r '[to_entries[] | select(.value != null) | "\(.key)->\(.value[].HostPort)"] | unique | join(" ")')
   check F-1 "published ports: $out" test "$out" = "8443/tcp->443"
-  for i in 8001 8444; do
-    code=$(docker run --rm --network "container:$kong" --user 65532 --cap-drop ALL "$img" \
-      curl -sk -m 3 -o /dev/null -w '%{http_code}' "https://127.0.0.1:$i/" 2> /dev/null)
-    check F-1 "nothing listens on admin port $i inside Kong (got ${code:-000})" test "${code:-000}" = 000
+  # From inside Kong's network namespace: the proxy port answers, the admin ports refuse (curl exit 7).
+  inside() { docker run --rm --network "container:$kong" --user 65532 --cap-drop ALL "$img" \
+    curl -sk -m 3 -o /dev/null -w '%{http_code}' "$1" 2> /dev/null; }
+  code=$(inside https://127.0.0.1:8443/)
+  check F-1 "probe inside Kong reaches the proxy port 8443 (HTTP ${code:-none})" test "${code:-000}" != 000
+  for i in http://127.0.0.1:8001/ https://127.0.0.1:8444/; do
+    inside "$i" > /dev/null; code=$?
+    check F-1 "nothing listens on admin $i inside Kong (curl exit $code, 7 is refused)" test "$code" -eq 7
   done
 
   # B-5 for Kong: the key is a mounted file, and Kong serves the certificate from ./secrets.
@@ -219,17 +223,18 @@ section_k1() {
     bash -c "set -- $code; [ \"\$1\" = 503 ] && awk -v t=\"\$2\" 'BEGIN { exit !(t >= 1.9 && t < 3) }'"
 
   # K-1 (e), and the forged-header part of (b) from the host: the limited route allows 3 a minute.
+  echo "        waiting for a fresh rate-limit minute"
   fresh_minute
   ok=0 limited=0
   for i in 1 2 3 4 5 6; do
     code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-$run-e")
     case $code in 200) ok=$((ok + 1)) ;; 429) limited=$((limited + 1)) ;; esac
   done
-  n=$(stub_received | jq --arg a "Bearer good-$run-e" '[.[] | select(.body.authorization == $a)] | length')
-  check K-1 "(e) $limited of 6 over the limit got 429; edge-auth saw ${n:-?}, the client got $ok 200s" \
-    test "$limited" -gt 0 -a "${n:--1}" -eq "$ok"
   code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-$run-b" \
     -H 'X-Forwarded-For: 198.51.100.7')
+  n=$(stub_received | jq --arg a "Bearer good-$run-e" '[.[] | select(.body.authorization == $a)] | length')
+  check K-1 "(e) 3 a minute: $ok got 200 and edge-auth saw ${n:-?}; $limited got 429 and never reached it" \
+    test "$ok" -eq 3 -a "$limited" -eq 3 -a "${n:--1}" -eq 3
   check K-1 "(b) from the host: a forged X-Forwarded-For stays in the same bucket (got $code)" test "$code" = 429
   notrun K-1 "(b) real LAN addresses and separate buckets: needs two off-host sources (k1 --from, spec open question 5)"
   rm -rf "$d"
@@ -238,9 +243,10 @@ section_k1() {
 # K-1 (b) from a device off the host. Prints the address Kong sees for this device, and checks
 # that a forged X-Forwarded-For does not move it to a fresh bucket.
 section_k1_from() {
-  local label=$1 url="https://$2" seen code i limited=0
-  seen=$(curl -sk "$url/spike/k1" -H "Authorization: Bearer good-from-$label" | jq -r '.headers["x-real-ip"]')
-  echo "        $label: Kong sees $seen. Compare with this device's own LAN address."
+  local label=$1 url="https://$2" mine=$3 seen code i limited=0
+  seen=$(curl -sk "$url/spike/k1" -H "Authorization: Bearer good-from-$label" | jq -r '.headers["x-real-ip"] // empty')
+  check K-1 "(b) $label: Kong sees ${seen:-nothing}, this device's LAN address is $mine" test "$seen" = "$mine"
+  echo "        waiting for a fresh rate-limit minute"
   fresh_minute
   for i in 1 2 3 4 5; do
     code=$(curl -sk -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H "Authorization: Bearer good-from-$label" \
@@ -253,8 +259,8 @@ section_k1_from() {
 
 [ $# -gt 0 ] || { sed -n '2,7p' "$0"; exit 2; }
 if [ "$1" = k1 ] && [ "${2:-}" = --from ]; then
-  [ $# -eq 4 ] || { echo "usage: scripts/spike-check k1 --from <label> <kong address>" >&2; exit 2; }
-  echo "== k1 --from $3"; section_k1_from "$3" "$4"; exit "$failed"
+  [ $# -eq 5 ] || { echo "usage: scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>" >&2; exit 2; }
+  echo "== k1 --from $3"; section_k1_from "$3" "$4" "$5"; exit "$failed"
 fi
 for s in "$@"; do
   fn="section_${s//-/_}"

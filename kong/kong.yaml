@@ -24,6 +24,9 @@ services:
                       "x-remote-user", "x-forwarded-for", "x-real-ip" }) do
                     kong.service.request.clear_header(h)
                   end
+                  -- Kong built the upstream X-Forwarded-For in access.before, from the client's
+                  -- header plus the real address. Replace it with the real address only (K-1 (d)).
+                  ngx.var.upstream_x_forwarded_for = ngx.var.remote_addr
           - name: rate-limiting
             config: { minute: 600, policy: local, limit_by: ip }
           - &post
@@ -79,12 +82,3 @@ services:
           - name: rate-limiting
             config: { minute: 3, policy: local, limit_by: ip }
           - *post
-
-# Global, so it runs in the rewrite phase, before Kong works out the upstream X-Forwarded-For
-# from the client's header (runloop access.before). Route plugins run too late for that, and
-# Kong would append the real address to a forged value (spec K-1 (d)).
-plugins:
-  - name: pre-function
-    config:
-      rewrite:
-        - kong.service.request.clear_header("x-forwarded-for")
