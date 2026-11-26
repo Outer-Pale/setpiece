@@ -675,22 +675,23 @@ wait_loki() {
 # K-5: @platformatic/kafka on Node 26, as svc-spike, reads the newest K-3 record with its key and
 # every header, and is refused when it produces. Needs a record from k3 on ev.spike.example.
 section_k5() {
-  local ref key ceid out got prod err
+  local ref key ceid runid out got prod err
   if ! (cd "$repo" && scripts/up) > /dev/null 2>&1; then fail K-5 "scripts/up failed"; return; fi
   k3_flags
   ref=$(k3_records | jq -sc '[.[] | select(any(.h[]; .key == "ce_id"))] | last // empty')
   if [ -z "$ref" ]; then fail K-5 "no K-3 record on ev.spike.example (run k3 first)"; return; fi
   key=$(jq -r .key <<< "$ref")
   ceid=$(jq -r '.h[] | select(.key == "ce_id") | .value' <<< "$ref")
+  runid=$(jq -r '.h[] | select(.key == "__debezium.context.runId") | .value' <<< "$ref")
   err=$(mktemp)
-  out=$(dc --profile k5 run --rm --no-deps -T k5 "$key" "$ceid" 2> "$err")
+  out=$(dc --profile k5 run --rm --no-deps -T k5 "$key" "$ceid" "$runid" 2> "$err")
   got=$(grep -m1 '"found"' <<< "$out")
   prod=$(grep -m1 '"produced"' <<< "$out")
   echo "        read:    ${got:-<nothing>}"
   echo "        produce: ${prod:-<nothing>}"
   [ -n "$got" ] && [ -n "$prod" ] || sed 's/^/        k5 stderr: /' "$err" | tail -15
   rm -f "$err"
-  check K-5 "svc-spike read the record with key $key and ce_id $ceid" jqin '.found == true and .key == $k and .headers.ce_id == $i' --arg k "$key" --arg i "$ceid" <<< "${got:-null}"
+  check K-5 "svc-spike read the record with key $key, ce_id $ceid, connector run $runid" jqin '.found == true and .key == $k and .headers.ce_id == $i' --arg k "$key" --arg i "$ceid" <<< "${got:-null}"
   check K-5 "the value is the record's plain JSON body" \
     jqin --argjson r "$ref" '(.value | fromjson) == $r.value' <<< "${got:-null}"
   check K-5 "every header the admin consumer sees is there with the same value" \

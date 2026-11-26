@@ -80,7 +80,7 @@ services:
     security_opt: ["no-new-privileges:true"]
 
   # One-shot: the K-5 Node 26 reader and refused writer, as svc-spike (spec K-5; §4.13).
-  # Run by spike-check k5 with `run --rm k5 <key> <ce_id>`. It installs the locked @platformatic/kafka
+  # Run by spike-check k5 with `run --rm k5 <key> <ce_id> <run id>`. It installs the locked @platformatic/kafka
   # into its tmpfs, reads the record with that key, then tries to produce.
   k5:
     image: node:26@sha256:f8e5d4bb28fa55c74f1345166a082a10b7c68f22304350c1ce0d18358ae94996
@@ -91,7 +91,7 @@ services:
       - |
         mkdir -p /tmp/app && cp /spike/package.json /spike/package-lock.json /spike/k5-consume.mjs /spike/k5-produce.mjs /tmp/app/
         cd /tmp/app && npm ci --omit=dev --no-audit --no-fund --loglevel=error >&2
-        node k5-consume.mjs "$$1" "$$2" || true
+        node k5-consume.mjs "$$1" "$$2" "$$3" || true
         node k5-produce.mjs
       - k5
     environment:

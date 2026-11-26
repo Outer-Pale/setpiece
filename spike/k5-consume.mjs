@@ -1,11 +1,11 @@
 // K-5: reads ev.spike.example as svc-spike with @platformatic/kafka and prints the record whose
-// key is argv[2] and ce_id header argv[3] as one JSON line {key, value, headers}. A key can repeat
-// (each K-3d re-snapshot republishes its rows), so ce_id picks the one record. Exits 1 if it isn't
-// found in 30 s.
+// key is argv[2], ce_id header argv[3] and __debezium.context.runId header argv[4] as one JSON line
+// {key, value, headers}. Each K-3d re-snapshot republishes its rows with the same key and ce_id, and
+// only the connector run id tells the copies apart. Exits 1 if it isn't found in 30 s.
 import { readFileSync } from 'node:fs'
 import { Consumer, stringDeserializers } from '@platformatic/kafka'
 
-const [want, wantId] = process.argv.slice(2)
+const [want, wantId, wantRun] = process.argv.slice(2)
 const consumer = new Consumer({
   clientId: 'k5-consume',
   groupId: `svc-spike-k5-${Date.now()}`,
@@ -18,7 +18,7 @@ const timer = setTimeout(() => { console.log(JSON.stringify({ found: false })); 
 try {
   const stream = await consumer.consume({ topics: ['ev.spike.example'], mode: 'earliest' })
   for await (const m of stream) {
-    if (m.key !== want || m.headers.get('ce_id') !== wantId) continue
+    if (m.key !== want || m.headers.get('ce_id') !== wantId || m.headers.get('__debezium.context.runId') !== wantRun) continue
     console.log(JSON.stringify({ found: true, key: m.key, value: m.value, headers: Object.fromEntries(m.headers) }))
     clearTimeout(timer)
     break
