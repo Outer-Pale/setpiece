@@ -34,8 +34,9 @@ services:
     cap_drop: [ALL]
     # cap_add: none. Runs as the image's appuser (uid 1000) and binds only 9092 and 9093.
     healthcheck:
-      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092",
-             "--command-config", "/tmp/kafka/admin.properties"]
+      # A small heap for the check's own JVM, which would otherwise take the broker's 512 MB.
+      test: ["CMD-SHELL", "KAFKA_HEAP_OPTS=-Xmx128m /opt/kafka/bin/kafka-broker-api-versions.sh
+             --bootstrap-server localhost:9092 --command-config /tmp/kafka/admin.properties > /dev/null"]
       interval: 15s
       timeout: 30s
       retries: 10
@@ -47,7 +48,7 @@ services:
     entrypoint: ["/bin/bash", "/opt/setpiece/init.sh"]
     volumes:
       - ./kafka:/opt/setpiece:ro
-    secrets: [kafka-admin, kafka-svc-collector, kafka-svc-spike]
+    secrets: [kafka-admin, kafka-connect, kafka-connect-producer, kafka-svc-collector, kafka-svc-spike]
     networks: [data]
     depends_on:
       kafka:

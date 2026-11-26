@@ -1,27 +1,27 @@
-GROUP LITERAL * User:svc-collector DESCRIBE
-GROUP LITERAL connect-cluster User:connect READ
-GROUP PREFIXED svc-spike User:svc-spike READ
-TOPIC LITERAL * User:svc-collector DESCRIBE
-TOPIC LITERAL connect-configs User:connect CREATE
-TOPIC LITERAL connect-configs User:connect DESCRIBE
-TOPIC LITERAL connect-configs User:connect DESCRIBE_CONFIGS
-TOPIC LITERAL connect-configs User:connect READ
-TOPIC LITERAL connect-configs User:connect WRITE
-TOPIC LITERAL connect-offsets User:connect CREATE
-TOPIC LITERAL connect-offsets User:connect DESCRIBE
-TOPIC LITERAL connect-offsets User:connect DESCRIBE_CONFIGS
-TOPIC LITERAL connect-offsets User:connect READ
-TOPIC LITERAL connect-offsets User:connect WRITE
-TOPIC LITERAL connect-status User:connect CREATE
-TOPIC LITERAL connect-status User:connect DESCRIBE
-TOPIC LITERAL connect-status User:connect DESCRIBE_CONFIGS
-TOPIC LITERAL connect-status User:connect READ
-TOPIC LITERAL connect-status User:connect WRITE
-TOPIC LITERAL ev.spike.example User:svc-spike DESCRIBE
-TOPIC LITERAL ev.spike.example User:svc-spike READ
-TOPIC PREFIXED audit. User:connect-producer DESCRIBE
-TOPIC PREFIXED audit. User:connect-producer WRITE
-TOPIC PREFIXED cmd. User:connect-producer DESCRIBE
-TOPIC PREFIXED cmd. User:connect-producer WRITE
-TOPIC PREFIXED ev. User:connect-producer DESCRIBE
-TOPIC PREFIXED ev. User:connect-producer WRITE
+GROUP LITERAL * User:svc-collector * DESCRIBE ALLOW
+GROUP LITERAL connect-cluster User:connect * READ ALLOW
+GROUP PREFIXED svc-spike User:svc-spike * READ ALLOW
+TOPIC LITERAL * User:svc-collector * DESCRIBE ALLOW
+TOPIC LITERAL connect-configs User:connect * CREATE ALLOW
+TOPIC LITERAL connect-configs User:connect * DESCRIBE ALLOW
+TOPIC LITERAL connect-configs User:connect * DESCRIBE_CONFIGS ALLOW
+TOPIC LITERAL connect-configs User:connect * READ ALLOW
+TOPIC LITERAL connect-configs User:connect * WRITE ALLOW
+TOPIC LITERAL connect-offsets User:connect * CREATE ALLOW
+TOPIC LITERAL connect-offsets User:connect * DESCRIBE ALLOW
+TOPIC LITERAL connect-offsets User:connect * DESCRIBE_CONFIGS ALLOW
+TOPIC LITERAL connect-offsets User:connect * READ ALLOW
+TOPIC LITERAL connect-offsets User:connect * WRITE ALLOW
+TOPIC LITERAL connect-status User:connect * CREATE ALLOW
+TOPIC LITERAL connect-status User:connect * DESCRIBE ALLOW
+TOPIC LITERAL connect-status User:connect * DESCRIBE_CONFIGS ALLOW
+TOPIC LITERAL connect-status User:connect * READ ALLOW
+TOPIC LITERAL connect-status User:connect * WRITE ALLOW
+TOPIC LITERAL ev.spike.example User:svc-spike * DESCRIBE ALLOW
+TOPIC LITERAL ev.spike.example User:svc-spike * READ ALLOW
+TOPIC PREFIXED audit. User:connect-producer * DESCRIBE ALLOW
+TOPIC PREFIXED audit. User:connect-producer * WRITE ALLOW
+TOPIC PREFIXED cmd. User:connect-producer * DESCRIBE ALLOW
+TOPIC PREFIXED cmd. User:connect-producer * WRITE ALLOW
+TOPIC PREFIXED ev. User:connect-producer * DESCRIBE ALLOW
+TOPIC PREFIXED ev. User:connect-producer * WRITE ALLOW

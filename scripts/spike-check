@@ -147,30 +147,50 @@ section_static_config() {
 # with scripts/up twice, so it needs the host's Docker daemon. Set COMPOSE_PROJECT_NAME to keep
 # the run apart from other stacks on the host.
 section_kafka() {
-  local dc ids1 ids2 cid1 cid2 kadmin acls deps v leaked c out
+  local dc ids1 ids2 cid1 cid2 kadmin acls deps v leaked c out rc t1 t2 id
   dc=(docker compose --project-directory "$repo" -f "$repo/compose.base.yaml")
   kadmin=(--bootstrap-server localhost:9092 --command-config /tmp/kafka/admin.properties)
   container_ids() { "${dc[@]}" ps -q kafka connect | sort | tr '\n' ' '; }
-  cluster_id() { "${dc[@]}" exec -T kafka cat /var/lib/kafka/data/cluster.id; }
+  # Both must be listed and healthy; `ps` leaves out a container that never started.
+  both_healthy() { test "$("${dc[@]}" ps --format '{{.Service}}={{.Health}}' kafka connect | sort | tr '\n' ' ')" = \
+    "connect=healthy kafka=healthy "; }
+  cluster_id() { "${dc[@]}" exec -T kafka sed -n 's/^cluster.id=//p' /var/lib/kafka/data/logs/meta.properties; }
+  init_started() { docker inspect --format '{{.State.StartedAt}}' "$("${dc[@]}" ps -aq kafka-init)" 2> /dev/null; }
 
   "$repo/scripts/up" > /dev/null 2>&1
-  check D-1 "first scripts/up: kafka and connect healthy" \
-    test "$("${dc[@]}" ps --format '{{.Health}}' kafka connect | sort -u | tr -d '\n')" = healthy
+  rc=$?
+  check D-1 "first scripts/up exits 0 (exit $rc)" test "$rc" -eq 0
+  check D-1 "first scripts/up: kafka and connect healthy" both_healthy
   ids1=$(container_ids)
-  cid1=$(cluster_id)
+  t1=$(init_started)
   "$repo/scripts/up" > /dev/null 2>&1
+  rc=$?
+  check D-1 "second scripts/up exits 0 (exit $rc)" test "$rc" -eq 0
+  check D-1 "second scripts/up: kafka and connect healthy" both_healthy
   ids2=$(container_ids)
-  cid2=$(cluster_id)
-  check D-1 "second scripts/up keeps the cluster id ($cid1, then $cid2)" test -n "$cid1" -a "$cid1" = "$cid2"
+  t2=$(init_started)
   check D-1 "second scripts/up recreates neither kafka nor connect" test -n "$ids1" -a "$ids1" = "$ids2"
+  check D-2 "kafka-init ran again on the second run ($t1, then $t2)" test -n "$t1" -a -n "$t2" -a "$t1" != "$t2"
   check D-2 "kafka-init exited 0 on the second run" \
     test "$("${dc[@]}" ps -a --format '{{.ExitCode}}' kafka-init)" = 0
+
+  # A restart runs start.sh again on the formatted volume (what every reboot does).
+  cid1=$(cluster_id)
+  "${dc[@]}" restart kafka > /dev/null 2>&1
+  "${dc[@]}" up -d --wait kafka connect > /dev/null 2>&1
+  cid2=$(cluster_id)
+  check D-1 "a kafka restart keeps the cluster id ($cid1, then $cid2)" test -n "$cid1" -a "$cid1" = "$cid2"
+  check D-1 "after the restart: kafka and connect healthy" both_healthy
 
   # No Kafka password in any of the three containers' environment, command or health check.
   leaked=""
   for c in kafka kafka-init connect; do
-    out=$(docker inspect --format '{{json .Config.Env}}{{json .Config.Cmd}}{{json .Config.Entrypoint}}{{json .Config.Healthcheck}}' \
-      "$("${dc[@]}" ps -aq "$c")")
+    id=$("${dc[@]}" ps -aq "$c")
+    if [ -z "$id" ] || ! out=$(docker inspect --format \
+      '{{json .Config.Env}}{{json .Config.Cmd}}{{json .Config.Entrypoint}}{{json .Config.Healthcheck}}' "$id"); then
+      leaked+=" $c:not-inspected"
+      continue
+    fi
     for v in "$repo"/secrets/kafka-*; do
       grep -qF "$(cat "$v")" <<< "$out" && leaked+=" $c:${v##*/}"
     done
@@ -178,8 +198,10 @@ section_kafka() {
   check D-1 "no Kafka password in docker inspect of kafka, kafka-init, connect (leaks:${leaked:- none})" test -z "$leaked"
 
   acls=$("${dc[@]}" exec -T kafka /opt/kafka/bin/kafka-acls.sh "${kadmin[@]}" --list |
-    sed -nE 's/.*resourceType=([A-Z]+), name=([^,]+), patternType=([A-Z]+)\).*/\1 \3 \2/p; s/.*principal=([^,]+), host=\*, operation=([A-Z_]+), permissionType=ALLOW.*/  \1 \2/p' |
-    awk '/^  / { print res, $1, $2; next } { res = $0 }' | LC_ALL=C sort)
+    sed -nE 's/.*resourceType=([A-Z]+), name=([^,]+), patternType=([A-Z]+)\).*/\1 \3 \2/p
+      s/.*\(principal=([^,]+), host=([^,]+), operation=([A-Z_]+), permissionType=([A-Z]+)\).*/  \1 \2 \3 \4/p
+      t; /principal=/s/.*/  UNPARSED &/p' |
+    awk '/^  / { $1 = $1; print res, $0; next } { res = $0 }' | LC_ALL=C sort)
   if diff <(LC_ALL=C sort "$repo/spike/expected/kafka-acls.txt") <(printf '%s\n' "$acls") > /dev/null; then
     pass D-2 "ACL list equals spike/expected/kafka-acls.txt ($(wc -l <<< "$acls") entries)"
   else

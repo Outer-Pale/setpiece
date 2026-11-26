@@ -24,4 +24,17 @@ sed "s|@ADMIN_PASSWORD@|$admin|" "$src/admin.properties.tmpl" > "$conf/admin.pro
   --add-scram "SCRAM-SHA-512=[name=connect,password=$(secret kafka-connect)]" \
   --add-scram "SCRAM-SHA-512=[name=connect-producer,password=$(secret kafka-connect-producer)]"
 
+# --ignore-formatted skips --add-scram on a formatted volume, so a new ./secrets would leave the
+# old admin credential in place and the health check failing with no reason given. Keep a hash
+# of the admin password on the volume and stop with the fix if it no longer matches. kafka-init
+# re-sets connect and connect-producer from their files on every run.
+hash=$(printf '%s:%s' "$(cat "$data/cluster.id")" "$admin" | sha256sum | cut -d' ' -f1)
+if [ ! -e "$data/admin.sha256" ]; then
+  printf '%s' "$hash" > "$data/admin.sha256"
+elif [ "$(cat "$data/admin.sha256")" != "$hash" ]; then
+  echo "kafka/start.sh: secrets/kafka-admin changed since this volume was formatted." >&2
+  echo "kafka/start.sh: restore the old file, or remove the volume (docker compose down -v)." >&2
+  exit 1
+fi
+
 exec /opt/kafka/bin/kafka-server-start.sh "$conf/server.properties"

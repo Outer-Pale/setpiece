@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # kafka-init: signs in as admin and creates the base users, topics and ACLs (design
 # checkpoint §4.10 "kafka-init signs in as admin and creates three things"; spec D-2).
-# Every step is safe to repeat: users are set from their secret files on every run, topics
-# use --if-not-exists, and adding an ACL that exists changes nothing.
+# Every step is safe to repeat: users other than admin are set from their secret files on
+# every run, topics use --if-not-exists, and adding an ACL that exists changes nothing.
 set -euo pipefail
 umask 077
 bin=/opt/kafka/bin
@@ -10,12 +10,15 @@ cfg=/tmp/admin.properties
 sed "s|@ADMIN_PASSWORD@|$(cat /run/secrets/kafka-admin)|" /opt/setpiece/admin.properties.tmpl > "$cfg"
 k=(--bootstrap-server kafka:9092 --command-config "$cfg")
 
-# Users: svc-*. The password is on kafka-configs' command line inside this container only, as
+# Users: svc-* (§4.10), and connect and connect-producer again, whose first credentials come
+# from start.sh's format, which a formatted volume skips. The password is on kafka-configs' command line inside this container only, as
 # kafka-storage's --add-scram is in start.sh; it is never in `docker inspect` (M0013).
 user() {
   "$bin/kafka-configs.sh" "${k[@]}" --alter --entity-type users --entity-name "$1" \
     --add-config "SCRAM-SHA-512=[password=$(cat "/run/secrets/kafka-$1")]" > /dev/null
 }
+user connect
+user connect-producer
 user svc-collector
 user svc-spike
 
