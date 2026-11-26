@@ -2,7 +2,7 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg k4 kafka telemetry
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg kafka k3 k4 telemetry
 #        scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>   (K-1 (b), off the host)
 # Sections that need the running stack use the Compose project in COMPOSE_PROJECT_NAME, if set.
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
@@ -320,6 +320,234 @@ section_k2() {
   k2_flip target-a fail/0; sleep 8
   seen=$(k2_count "$url")
   check K-2 "passive: target-a back once it answers again ($seen)" bash -c "[[ '$seen' =~ $k2_both ]]"
+}
+
+# K-3 helpers. Kafka commands run inside the kafka container as admin; Connect's REST API is
+# reached from inside connect, which is the only place it can be (§4.12).
+kafka_sh() { local t=$1; shift; dc exec -T kafka "/opt/kafka/bin/$t" --bootstrap-server localhost:9092 "$@"; }
+connect_api() { dc exec -T connect curl -s -X "$1" -H 'Content-Type: application/json' "http://localhost:8083$2" "${@:3}"; }
+connector_state() { connect_api GET /connectors/spike/status | jq -r '[.connector.state, (.tasks[]?.state)] | join(" ")' 2> /dev/null; }
+wait_state() { local i; for i in $(seq 60); do [ "$(connector_state)" = "$1" ] && return 0; sleep 2; done; return 1; }
+# -q drops command tags such as "INSERT 0 1"; PGOPTIONS drops NOTICEs.
+psql_spike() { dc exec -T -u postgres -e PGOPTIONS='-c client_min_messages=warning' postgres \
+  psql -X -q -At -v ON_ERROR_STOP=1 -d spike -c "$1"; }
+end_offset() { kafka_sh kafka-get-offsets.sh --command-config /tmp/kafka/admin.properties --topic "$1" --time -1 2> /dev/null |
+  awk -F: '$3 ~ /^[0-9]+$/ { s += $3; n++ } END { if (n) print s }'; }
+# The console consumer's option names, which Kafka 4 renamed; set once per run by k3_flags.
+k3_cc=--consumer.config k3_fp=--property
+k3_flags() {
+  local help
+  help=$(kafka_sh kafka-console-consumer.sh --help 2>&1)
+  grep -q -- --command-config <<< "$help" && k3_cc=--command-config
+  grep -q -- --formatter-property <<< "$help" && k3_fp=--formatter-property
+}
+# Every record on ev.spike.example as one JSON line: {h: [{key, value}], key, value}.
+# The host's Kafka printed headers with the default separators ("," and ":") despite the
+# separator properties, so the parser takes either: "|" between headers if any is present, else
+# ","; and per header the first of "=" or ":" (header names here contain neither).
+k3_records() {
+  kafka_sh kafka-console-consumer.sh "$k3_cc" /tmp/kafka/admin.properties --topic ev.spike.example \
+    --from-beginning --timeout-ms 8000 "$k3_fp" print.key=true "$k3_fp" print.headers=true \
+    "$k3_fp" headers.separator='|' "$k3_fp" headers.key.separator='=' 2> /dev/null |
+    jq -Rc 'split("\t") | { h: (.[0] | split(if test("[|]") then "|" else "," end)
+        | map(([index("="), index(":")] | map(select(. != null)) | min) as $i | { key: .[:$i], value: .[$i + 1:] })),
+      key: .[1], value: (.[2:] | join("\t") | fromjson? // .) }'
+}
+# Waits until ev.spike.example holds at least $2 records with key $1; leaves them in $3.
+k3_wait() { local i; for i in $(seq 8); do k3_records | jq -c --arg k "$1" 'select(.key == $k)' > "$3"
+  [ "$(wc -l < "$3")" -ge "$2" ] && return 0; done; return 1; }
+# Inserts one outbox row with every column set, with seq $4 if given. Prints the row as JSON.
+k3_insert() {
+  local sc="" sv="" ov=""
+  [ -n "${4:-}" ] && { sc="seq, "; sv="$4, "; ov="overriding system value"; }
+  psql_spike "insert into chassis_outbox (${sc}id, kind, topic, aggregatetype, aggregateid, type, payload, ce_subject,
+      ce_dataschema, ce_tenantid, ce_aggregateversion, ce_correlationid, ce_causationid, ce_traceparent,
+      ce_authtype, ce_authid, ce_authclaims) $ov
+    values (${sv}gen_random_uuid(), 'event', '$1', 'example', '$2', 'spike.example.created.v1',
+      '{\"run\": \"$2\", \"n\": $3}', 'examples/$2', 'https://schemas.setpiece.invalid/spike/example/v1.json',
+      'tenant-spike', $3, 'corr-$2', 'cause-$2', '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+      'user', 'sub-spike', '{\"client_id\": \"spike-client\"}')
+    returning row_to_json(chassis_outbox)"
+}
+# Adds or removes connect-producer's write on the heartbeat topic ($@: --add, or --remove --force).
+k3_hb_acl() { dc exec -T kafka /opt/kafka/bin/kafka-acls.sh --bootstrap-server localhost:9092 \
+  --command-config /tmp/kafka/admin.properties "$@" --allow-principal User:connect-producer \
+  --operation Write --operation Describe --topic __debezium-heartbeat.cdc.spike > /dev/null 2>&1; }
+# Writes a K-3 password file into ./secrets if it is missing, under B-2's rules.
+spike_secret() {
+  local f="$repo/secrets/$1" v
+  [ -e "$f" ] && return
+  v=$( (LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom || true) | head -c 32)
+  (umask 077 && printf '%s' "$v" > "$f.tmp" && chmod 0444 "$f.tmp" && mv "$f.tmp" "$f")
+}
+
+# K-3 runs in k3_run; k3_cleanup always follows it, whichever way k3_run returned.
+section_k3() {
+  local d run
+  d=$(mktemp -d)
+  run="k3-$(date +%s)"
+  k3_run
+  k3_cleanup
+  rm -rf "$d"
+}
+k3_run() {
+  local row id out a b lsn1 lsn2 i ids order
+  # The base stack, then the fixture: secrets, hba lines, the database, connect with its secret.
+  if ! (cd "$repo" && scripts/up) > "$d/up.log" 2>&1; then
+    fail K-3 "scripts/up failed: $(tail -3 "$d/up.log" | tr '\n' ' ')"; return
+  fi
+  k3_flags
+  spike_secret spike_owner; spike_secret spike_cdc
+  cp "$repo/spike/hba-spike.conf" "$repo/pg/hba.d/spike.conf"
+  psql_su "select pg_reload_conf()" > /dev/null
+  if ! dc run --rm --no-deps -T spike-init > "$d/init.log" 2>&1 || ! dc up -d --no-deps connect > "$d/c.log" 2>&1; then
+    fail K-3 "fixture did not start: $(tail -3 "$d/init.log" "$d/c.log" | tr '\n' ' ')"; return
+  fi
+  for i in $(seq 60); do connect_api GET /connectors > /dev/null 2>&1 && break; sleep 3; done
+  # §4.2 erratum (E03 D-014): Debezium's heartbeat record is produced, so its offset commits and the slot
+  # moves. Its topic and connect-producer's write ACL stand in for what kafka-init would generate.
+  kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --create --if-not-exists \
+    --topic __debezium-heartbeat.cdc.spike --partitions 1 --replication-factor 1 > /dev/null 2>&1
+  k3_hb_acl --add
+  connect_api PUT /connectors/spike/config --data-binary @- < "$repo/spike/connect-spike.json" > "$d/put.json"
+  check K-3 "connector spike and its task RUNNING (heartbeat lowered to 10 s for the test)" wait_state "RUNNING RUNNING"
+  kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --create --if-not-exists \
+    --topic ev.other.example --partitions 1 --replication-factor 1 > /dev/null 2>&1
+  check K-3b "topic ev.other.example exists" \
+    kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --describe --topic ev.other.example
+
+  # K-3 (a), (b), (c): one row with every column, read back as admin.
+  row=$(k3_insert ev.spike.example "$run-a" 1)
+  if ! k3_wait "$run-a" 1 "$d/a.json"; then
+    fail K-3 "no record with key $run-a reached ev.spike.example (connector: $(connector_state))"
+  fi
+  out=$(head -1 "$d/a.json")
+  echo "        row:     $row"
+  echo "        headers: $(jq -c '[.h[] | "\(.key)=\(.value)"]' <<< "${out:-null}")"
+  printf '%s\n%s\n' "${out:-null}" "$row" > "$d/a2.json"
+  check K-3 "(a) key is the plain string aggregateid ($(jq -r .key <<< "${out:-null}"))" jqt '.[0].key == .[1].aggregateid' "$d/a2.json"
+  check K-3 "(b) value is the plain JSON payload, no schema envelope ($(jq -c .value <<< "${out:-null}"))" \
+    jqt '.[0].value == .[1].payload' "$d/a2.json"
+  check K-3 "(c) text headers equal their columns (ce_id from id, ce_type from type)" \
+    jqt '(.[0].h | map({(.key): .value}) | add) as $h | .[1] as $r
+      | $h.ce_id == $r.id and $h.ce_type == $r.type and ([ "ce_subject", "ce_dataschema", "ce_tenantid",
+        "ce_correlationid", "ce_causationid", "ce_traceparent", "ce_authtype", "ce_authid", "ce_authclaims" ]
+        | all(. as $c | $h[$c] == $r[$c]))' "$d/a2.json"
+  check K-3 "(c) ce_aggregateversion equal as a number ($(jq -r '.h[] | select(.key == "ce_aggregateversion") | .value' <<< "${out:-null}"))" \
+    jqt '(.[0].h | map({(.key): .value}) | add) as $h | ($h.ce_aggregateversion | tonumber?) == .[1].ce_aggregateversion' "$d/a2.json"
+  a=$(jq -r '.h[] | select(.key == "ce_time") | .value' <<< "${out:-null}")
+  id=$(jq -r .id <<< "$row")
+  check K-3 "(c) ce_time equal as an instant (header $a, column $(jq -r .ce_time <<< "$row"))" \
+    time_eq "$a" "$id"
+  check K-3 "(c) ce_specversion 1.0, content-type application/json, exactly one ce_source = spike" \
+    jqt '.[0].h as $h | ([$h[] | select(.key == "ce_source")] | map(.value)) == ["spike"]
+      and ([$h[] | select(.key == "ce_specversion") | .value] == ["1.0"])
+      and ([$h[] | select(.key == "content-type") | .value] == ["application/json"])' "$d/a2.json"
+
+  # K-3b: rows naming another service's topic, or a Connect topic, go nowhere.
+  a=$(end_offset ev.other.example); b=$(end_offset connect-configs)
+  k3_insert ev.other.example "$run-b1" 1 > /dev/null
+  k3_insert connect-configs "$run-b2" 1 > /dev/null
+  k3_insert ev.spike.example "$run-b3" 1 > /dev/null
+  k3_wait "$run-b3" 1 "$d/b.json"
+  # Taken once the spike rows are delivered: no spike change but the heartbeat's comes after it.
+  lsn1=$(psql_su "select pg_current_wal_lsn()")
+  check K-3b "the next valid row still arrives" test -s "$d/b.json"
+  check K-3b "connector and task still RUNNING after the foreign rows" wait_state "RUNNING RUNNING"
+  # end_offset prints nothing when the read fails, so an empty value fails these checks.
+  check K-3b "ev.other.example end offset unchanged ($a -> $(end_offset ev.other.example))" \
+    test -n "$a" -a "$a" = "$(end_offset ev.other.example)"
+  check K-3b "connect-configs end offset unchanged and readable ($b -> $(end_offset connect-configs))" \
+    test -n "$b" -a "${b:-0}" -gt 0 -a "$b" = "$(end_offset connect-configs)"
+  check K-3b "no record for the foreign rows on ev.spike.example" \
+    no_record "$run-b1" "$run-b2"
+
+  # K-3c: spike is quiet while the postgres database writes WAL; the heartbeat moves the slot.
+  # lsn1 is past every spike row's commit, so the slot can pass it only by the heartbeat.
+  # The slot moves when Connect flushes offsets (every 60 s by default), so allow up to 120 s.
+  # Each sample: slot position, the heartbeat row's time, and the LSN Connect has stored.
+  for i in $(seq 36); do
+    psql_su "set client_min_messages = warning; create table if not exists spike_wal (x int);
+      insert into spike_wal select generate_series(1, 20000); truncate spike_wal" > /dev/null
+    sleep 5
+    lsn2=$(psql_su "select confirmed_flush_lsn from pg_replication_slots where slot_name = 'cdc_spike'")
+    [ $((i % 3)) -eq 0 ] && echo "        K-3c $((i * 5))s: slot $lsn2, heartbeat $(psql_spike "select at from chassis_heartbeat" 2> /dev/null), connect offset $(connect_api GET /connectors/spike/offsets 2> /dev/null | jq -c '[.offsets[]?.offset]' 2> /dev/null)"
+    [ "$i" -ge 5 ] && lsn_after "$lsn1" "$lsn2" && break
+  done
+  psql_su "drop table if exists spike_wal" > /dev/null
+  lsn_after "$lsn1" "$lsn2" || dc logs --since 5m connect 2>&1 | grep -iE 'warn|error|heartbeat|flush|lsn' | tail -25 | sed 's/^/        connect: /'
+  echo "        K-3c heartbeat topic end offset: $(end_offset __debezium-heartbeat.cdc.spike)"
+  check K-3c "confirmed_flush_lsn of cdc_spike passed the WAL position after the last spike row within $((i * 5)) s, heartbeat 10 s ($lsn1 -> $lsn2)" \
+    lsn_after "$lsn1" "$lsn2"
+
+  # K-3d: three rows on one key, then stop, delete the offsets and resume (§4.2 recovery 1, 3, 4).
+  # Three seq values are taken first and the rows inserted as 3, 1, 2, so the heap is out of seq
+  # order and a snapshot without the `order by seq` override would not publish them in order.
+  local sq s1 id1 id2 id3
+  sq=$(psql_spike "select pg_get_serial_sequence('chassis_outbox', 'seq')")
+  s1=$(psql_spike "select min(v) from (select nextval('$sq') as v from generate_series(1, 3)) t")
+  id3=$(k3_insert ev.spike.example "$run-d" 3 $((s1 + 2)) | jq -r .id)
+  id1=$(k3_insert ev.spike.example "$run-d" 1 "$s1" | jq -r .id)
+  id2=$(k3_insert ev.spike.example "$run-d" 2 $((s1 + 1)) | jq -r .id)
+  ids="$id1 $id2 $id3 "
+  k3_wait "$run-d" 3 "$d/d1.json"
+  order=$(psql_spike "select array_agg(seq order by ctid) = array_agg(seq order by seq) from chassis_outbox where aggregateid = '$run-d'")
+  check K-3d "precondition: the key's rows are out of seq order in the heap" test "$order" = f
+  connect_api PUT /connectors/spike/stop > /dev/null
+  check K-3d "connector stopped" wait_state STOPPED
+  connect_api DELETE /connectors/spike/offsets > "$d/off.json"
+  connect_api PUT /connectors/spike/resume > /dev/null
+  wait_state "RUNNING RUNNING"
+  k3_wait "$run-d" 6 "$d/d2.json"
+  out=$(tail -3 "$d/d2.json" | jq -r '.h[] | select(.key == "ce_id") | .value' | tr '\n' ' ')
+  echo "        offsets delete: $(cat "$d/off.json")"
+  check K-3d "re-snapshot published the key's rows again in seq order (inserted: $ids; again: $out)" \
+    test "$(wc -l < "$d/d2.json")" -ge 6 -a "$out" = "$ids"
+
+}
+# No connector, offsets or slot left behind, and connect back to its base config. Safe to run
+# after any early return of k3_run.
+k3_cleanup() {
+  local i
+  if connect_api GET /connectors/spike > /dev/null 2>&1; then
+    connect_api PUT /connectors/spike/stop > /dev/null; wait_state STOPPED
+    connect_api DELETE /connectors/spike/offsets > /dev/null
+    connect_api DELETE /connectors/spike > /dev/null
+  fi
+  for i in $(seq 10); do
+    psql_su "select pg_terminate_backend(active_pid) from pg_replication_slots where slot_name = 'cdc_spike' and active_pid is not null" > /dev/null 2>&1
+    psql_su "select pg_drop_replication_slot('cdc_spike') from pg_replication_slots where slot_name = 'cdc_spike'" > /dev/null 2>&1
+    [ -z "$(psql_su "select 1 from pg_replication_slots where slot_name = 'cdc_spike'")" ] && break
+    sleep 2
+  done
+  k3_hb_acl --remove --force
+  kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --delete --if-exists \
+    --topic __debezium-heartbeat.cdc.spike > /dev/null 2>&1
+  rm -f "$repo/pg/hba.d/spike.conf"; psql_su "select pg_reload_conf()" > /dev/null
+  (cd "$repo" && scripts/up) > "$d/up2.log" 2>&1
+  check K-3 "cleanup: no connector spike ($(connect_api GET /connectors 2> /dev/null))" \
+    test "$(connect_api GET /connectors 2> /dev/null | jq -c 'index("spike")')" = null
+  check K-3 "cleanup: connect-producer's heartbeat ACL removed" \
+    test -z "$(dc exec -T kafka /opt/kafka/bin/kafka-acls.sh --bootstrap-server localhost:9092 \
+      --command-config /tmp/kafka/admin.properties --list --topic __debezium-heartbeat.cdc.spike 2> /dev/null | grep connect-producer)"
+  check K-3 "cleanup: no replication slot cdc_spike" \
+    test -z "$(psql_su "select 1 from pg_replication_slots where slot_name = 'cdc_spike'")"
+  check K-3 "a base-only scripts/up afterwards brings connect back without the fixture secret" \
+    connect_base
+}
+# True when the header text $1, read as an instant, equals ce_time of outbox row $2.
+time_eq() { [ "$(psql_spike "select '$1'::timestamptz = ce_time from chassis_outbox where id = '$2'" 2> /dev/null)" = t ]; }
+# True when no record on ev.spike.example has key $1 or $2.
+# The topic is never empty here, so an empty read is a failed read, not "no record".
+no_record() { local r; r=$(k3_records); [ -n "$r" ] && ! jq -e --arg a "$1" --arg b "$2" 'select(.key == $a or .key == $b)' <<< "$r" > /dev/null; }
+# True when LSN $2 is after LSN $1.
+lsn_after() { [ -n "$1" ] && [ -n "$2" ] && [ "$(psql_su "select '$2'::pg_lsn > '$1'::pg_lsn")" = t ]; }
+# True when connect is healthy and no longer mounts the fixture's secret.
+connect_base() {
+  local c
+  c=$(dc ps -q connect)
+  [ "$(docker inspect -f '{{.State.Health.Status}}' "$c")" = healthy ] &&
+    ! docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' "$c" | grep -q spike_cdc
 }
 
 [ $# -gt 0 ] || { sed -n '2,7p' "$0"; exit 2; }
