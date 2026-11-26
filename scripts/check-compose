@@ -3,8 +3,10 @@
 # The checks against the running stack are spike-check's (issue OUT-155).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
 
-config=$(docker compose -f compose.base.yaml -f spike/compose.spike.yaml config --format json)
+config=$(docker compose -f compose.base.yaml -f spike/compose.spike.yaml --profile "*" config --format json)
 long_running=$(sed -E 's/#.*//; s/[[:space:]]//g; /^$/d' platform/services.txt)
 
 jq -r --arg lr "$long_running" '
@@ -17,20 +19,20 @@ jq -r --arg lr "$long_running" '
     ( if ($long | index($n)) then
         ( if $s.restart == "unless-stopped" then empty
           else "\($n): restart is not unless-stopped (A-7)" end ),
-        ( if ($s.healthcheck.test // null) != null then empty
+        ( if ($s.healthcheck.disable != true)
+             and (($s.healthcheck.test // []) | length > 0 and .[0] != "NONE") then empty
           else "\($n): no health check (A-8)" end )
       else empty end ),
     ( ($s.environment // {}) | to_entries[]
       | select(.key | test("PASSWORD|SECRET|TOKEN|KEY"; "i"))
-      | select(.key | test("_FILE$"; "i") | not)
-      | select((.value // "") | tostring | test("^/run/secrets/") | not)
+      | select((.value // "") | tostring | test("^/run/secrets/[A-Za-z0-9._-]+$") | not)
       | "\($n): \(.key) has a literal value in environment (B-6)" )
-' <<< "$config" > /tmp/check-compose.$$ || true
+' <<< "$config" > "$out"
 
-if [ -s /tmp/check-compose.$$ ]; then
-  cat /tmp/check-compose.$$
-  rm -f /tmp/check-compose.$$
+if [ -s "$out" ]; then
+  cat "$out"
   exit 1
 fi
-rm -f /tmp/check-compose.$$
-echo "check-compose: $(jq '.services // {} | length' <<< "$config") containers, all checks pass"
+count=$(jq '.services // {} | length' <<< "$config")
+[[ $count =~ ^[0-9]+$ ]] || { echo "check-compose: could not count containers" >&2; exit 1; }
+echo "check-compose: $count containers, all checks pass"

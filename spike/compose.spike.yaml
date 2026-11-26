@@ -10,3 +10,14 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     networks: [services]
+
+  # An HTTP and TLS client the checks attach to a network or another container's namespace
+  # (K-4 on idp, K-6). One-shot: `docker compose ... run --rm probe <command>`.
+  probe:
+    image: curlimages/curl:8.17.0@sha256:935d9100e9ba842cdb060de42472c7ca90cfe9a7c96e4dacb55e79e560b3ff40
+    profiles: [probe]
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [services]

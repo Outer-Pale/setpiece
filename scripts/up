@@ -37,7 +37,7 @@ fi
 
 # 3. Every long-running service, named so one-shot containers are never waited on.
 services=()
-while IFS= read -r s; do
+while IFS= read -r s || [ -n "$s" ]; do
   s=${s%%#*}
   s=${s//[[:space:]]/}
   [ -n "$s" ] && services+=("$s")
