@@ -2,7 +2,7 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k4
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
 # shellcheck disable=SC2329
 set -uo pipefail
@@ -139,6 +139,68 @@ section_static_config() {
   local rc=$?
   printf '%s\n' "$out" | sed 's/^/        /'
   check K-6d "static compose checks (digests, cap_drop, restart, health check, no literal secrets)" test "$rc" -eq 0
+}
+
+# jq as a test: exit status only.
+jqt() { jq -e "$@" > /dev/null; }
+
+# Decode one base64url JWT part to JSON.
+jwt_part() { local p; p=$(cut -d. -f"$2" <<< "$1" | tr '_-' '/+'); while [ $((${#p} % 4)) -ne 0 ]; do p+="="; done; base64 -d <<< "$p"; }
+
+# K-4, E-1, E-2 and B-5 for Keycloak, against the running stack (`scripts/up`). The project is
+# COMPOSE_PROJECT_NAME, or `setpiece` from compose.base.yaml.
+section_k4() {
+  local dc=(docker compose -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml")
+  local id nets idp d token header claims tenant probe
+  id=$("${dc[@]}" ps -q keycloak)
+  if [ -z "$id" ]; then fail K-4 "keycloak is not running (run scripts/up first)"; return; fi
+
+  nets=$(docker inspect "$id" --format '{{json .NetworkSettings.Networks}}' | jq -r 'keys[]')
+  idp=$(grep -E '_idp$' <<< "$nets" || true)
+  check E-2 "keycloak's networks: $(tr '\n' ' ' <<< "$nets")(idp only)" \
+    test "$(wc -l <<< "$nets")" -eq 1 -a -n "$idp"
+  check B-5 "keycloak is healthy with its passwords from files, none in its environment or command" bash -c \
+    "[ \"\$(docker inspect '$id' --format '{{.State.Health.Status}}')\" = healthy ] &&
+     ! docker inspect '$id' --format '{{json .Config.Env}} {{json .Config.Cmd}} {{json .Config.Entrypoint}}' |
+       grep -Eq 'KC_DB_PASSWORD|KC_BOOTSTRAP_ADMIN_PASSWORD'"
+
+  # The test user's password: never committed (E-1), written here under the B-2 rules.
+  d=$(mktemp -d)
+  tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 32 > "$d/pw"
+  chmod 0444 "$d/pw"
+  # shellcheck disable=SC2016 # expands inside the container
+  if ! "${dc[@]}" exec -T keycloak bash -c '
+      pw=$(cat); c=$(mktemp)
+      kc=/opt/keycloak/bin/kcadm.sh
+      "$kc" config credentials --config "$c" --server http://127.0.0.1:8080 --realm master \
+        --user admin --password "$(< /run/secrets/keycloak-admin)" &&
+      "$kc" set-password --config "$c" -r setpiece --username spike-user --new-password "$pw"
+      rc=$?; rm -f "$c"; exit $rc' < "$d/pw" > "$d/kcadm.log" 2>&1; then
+    fail E-1 "kcadm.sh could not set the test user's password: $(tail -1 "$d/kcadm.log")"
+    rm -rf "$d"; return
+  fi
+  pass E-1 "test user's password set with kcadm.sh from a secret file (not in realm.json)"
+  check E-1 "realm.json holds no credentials" bash -c "! jq -e '[.. | objects | select(has(\"credentials\") or has(\"secret\"))] | length > 0' '$repo/keycloak/realm.json' > /dev/null"
+
+  # The token, from the probe image attached to idp only.
+  probe=$("${dc[@]}" --profile probe config --format json | jq -r '.services.probe.image')
+  token=$(docker run --rm --network "$idp" --user 65532:65532 --read-only --cap-drop ALL \
+      --security-opt no-new-privileges:true -v "$d/pw:/run/pw:ro" "$probe" -sS --fail-with-body \
+      -d grant_type=password -d client_id=edge -d username=spike-user --data-urlencode password@/run/pw \
+      http://keycloak:8080/realms/setpiece/protocol/openid-connect/token | jq -r '.access_token // empty')
+  rm -rf "$d"
+  if [ -z "$token" ]; then fail K-4 "no access token from the edge client"; return; fi
+  header=$(jwt_part "$token" 1)
+  claims=$(jwt_part "$token" 2)
+  tenant=$(jq -r '.organizations[] | select(.alias == "spike") | .attributes.tenant_id[0]' "$repo/keycloak/realm.json")
+  echo "        header: $(jq -c . <<< "$header")"
+  echo "        claims: $(jq -c '{aud, client_id, azp, organization}' <<< "$claims")"
+  check K-4 "header typ is at+jwt" jqt '.typ == "at+jwt"' <<< "$header"
+  check K-4 "aud holds the edge client" jqt '[.aud] | flatten | index("edge") != null' <<< "$claims"
+  check K-4 "client_id is edge" jqt '.client_id == "edge"' <<< "$claims"
+  # shellcheck disable=SC2016 # a jq variable
+  check K-4 "tenant_id is exactly the organisation's attribute ($tenant)" \
+    jqt --arg t "$tenant" '.organization.spike.tenant_id == [$t]' <<< "$claims"
 }
 
 [ $# -gt 0 ] || { sed -n '2,6p' "$0"; exit 2; }
