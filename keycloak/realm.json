@@ -1,0 +1,151 @@
+{
+  "realm": "setpiece",
+  "enabled": true,
+  "organizationsEnabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "defaultDefaultClientScopes": [
+    "basic",
+    "organization"
+  ],
+  "clientScopes": [
+    {
+      "name": "basic",
+      "protocol": "openid-connect",
+      "description": "The subject claim",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "sub",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-sub-mapper",
+          "consentRequired": false,
+          "config": {
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "name": "organization",
+      "protocol": "openid-connect",
+      "description": "Organisation membership, with the organisation's attributes (design checkpoint \u00a74.6 settings 2 and 3)",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "organization",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-organization-membership-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "organization",
+            "jsonType.label": "JSON",
+            "multivalued": "true",
+            "addOrganizationAttributes": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "edge",
+      "name": "Setpiece edge",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "https://localhost/*"
+      ],
+      "attributes": {
+        "access.token.header.type.rfc9068": "true",
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": [
+        "basic",
+        "organization"
+      ],
+      "protocolMappers": [
+        {
+          "name": "edge audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "edge",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "client_id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "consentRequired": false,
+          "config": {
+            "claim.name": "client_id",
+            "claim.value": "edge",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
+      "optionalClientScopes": [],
+      "description": "Build step 1's hand-written edge client (E03 spec E-1). Direct access grants are on only so spike-check k4 can sign the test user in; build step 5's keycloak-init owns the real client. keycloak-init must turn directAccessGrantsEnabled off."
+    }
+  ],
+  "users": [
+    {
+      "username": "spike-user",
+      "enabled": true,
+      "email": "spike-user@spike.example",
+      "emailVerified": true,
+      "firstName": "Spike",
+      "lastName": "User",
+      "requiredActions": []
+    }
+  ],
+  "organizations": [
+    {
+      "name": "Spike",
+      "alias": "spike",
+      "enabled": true,
+      "description": "Build step 1's test organisation (E03 spec E-1)",
+      "attributes": {
+        "tenant_id": [
+          "5d0c3f0e-7a8b-4c1d-9e2f-3a4b5c6d7e8f"
+        ]
+      },
+      "domains": [
+        {
+          "name": "spike.example",
+          "verified": false
+        }
+      ],
+      "members": [
+        {
+          "username": "spike-user"
+        }
+      ]
+    }
+  ],
+  "defaultOptionalClientScopes": [],
+  "bruteForceProtected": true
+}
