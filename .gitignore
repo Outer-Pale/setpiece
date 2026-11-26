@@ -4,3 +4,5 @@ generated/
 .env.*
 pg/hba.d/*.conf
 node_modules/
+.spike-clean/
+.spike-clean.new/

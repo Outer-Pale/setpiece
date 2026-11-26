@@ -899,7 +899,7 @@ section_stats() {
 # K-6, K-6b, K-6c: Connect's REST API is out of reach from outside `data`; the Collectors hold
 # nothing extra; no long-running container can open a raw socket.
 section_k6() {
-  local cfg data probe bb c name nets ip rc1 rc2 bad n svc ctl capbnd capadd mounts
+  local cfg data probe bb c name nets ip rc1 rc2 bad n svc ctl capbnd capadd want mounts priv devs
   cfg=$(dc --profile probe config --format json)
   data=$(jq -r '.networks.data.name' <<< "$cfg")
   probe=$(jq -r '.services.probe.image' <<< "$cfg")
@@ -913,36 +913,45 @@ section_k6() {
   ctl+=" $(docker run --rm --network "$data" --user 65532:65532 --read-only --cap-drop ALL "$probe" \
     -s -o /dev/null -m 5 -w '%{http_code}' "http://$ip:8083/" 2> /dev/null)"
   check K-6 "control: a probe on data reaches connect:8083 and $ip:8083 (HTTP $ctl)" test "$ctl" = "200 200"
-  # Everything on services or ops and not on data, from docker network inspect, plus Keycloak.
+  # Every running container in the project that is not on data, from docker inspect. Only curl's
+  # could-not-reach codes count as unreachable (6 no such name, 7 refused or no route, 28 timeout);
+  # any other code, Docker's own included, is an error.
   bad="" n=0
   for c in $(dc ps -q); do
     name=$(docker inspect -f '{{.Name}}' "$c" | tr -d /)
     nets=$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$c")
     svc=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c")
-    grep -qw -- "$data" <<< "$nets" && continue
-    grep -qwE -- "$(jq -r '[.networks.services.name, .networks.ops.name] | join("|")' <<< "$cfg")" <<< "$nets" || [ "$svc" = keycloak ] || continue
+    [[ " $nets " == *" $data "* ]] && continue
     n=$((n + 1))
     docker run --rm --network "container:$c" --user 65532:65532 --read-only --cap-drop ALL "$probe" \
       -s -o /dev/null -m 3 http://connect:8083/ > /dev/null 2>&1; rc1=$?
     docker run --rm --network "container:$c" --user 65532:65532 --read-only --cap-drop ALL "$probe" \
       -s -o /dev/null -m 3 "http://$ip:8083/" > /dev/null 2>&1; rc2=$?
     echo "        $svc ($name): by name curl exit $rc1, by address curl exit $rc2"
-    [ "$rc1" -ne 0 ] && [ "$rc2" -ne 0 ] || bad+=" $svc"
+    case "$rc1 $rc2" in
+      [67]\ [67] | [67]\ 28 | 28\ [67] | 28\ 28) ;;
+      *) bad+=" $svc:$rc1/$rc2" ;;
+    esac
   done
-  check K-6 "none of the $n containers on services or ops but not data, nor Keycloak, reaches Connect's 8083 (reached:${bad:- none})" \
+  check K-6 "none of the $n running containers not on data reaches Connect's 8083 (offenders:${bad:- none})" \
     test -z "$bad" -a "$n" -gt 0 -a -n "$ip"
-  # K-6b: the Collectors mount no Docker socket, container logs or ./secrets, and add no capability.
+  # K-6b: the Collectors mount no Docker socket, container logs or ./secrets (nor a folder holding
+  # them), are not privileged, and add no capability or device.
   bad=""
   for svc in otel-collector otel-hostmetrics; do
     c=$(dc ps -q "$svc" | head -1)
     [ -n "$c" ] || { bad+=" $svc:not-running"; continue; }
     mounts=$(docker inspect -f '{{range .Mounts}}{{.Source}}:{{.Destination}} {{end}}' "$c")
     capadd=$(docker inspect -f '{{json .HostConfig.CapAdd}}' "$c")
-    echo "        $svc mounts: $mounts cap_add: $capadd"
-    grep -qE 'docker\.sock|/var/lib/docker/containers|/secrets' <<< "$mounts" && bad+=" $svc:mount"
+    priv=$(docker inspect -f '{{.HostConfig.Privileged}}' "$c")
+    devs=$(docker inspect -f '{{json .HostConfig.Devices}}' "$c")
+    echo "        $svc mounts: $mounts cap_add: $capadd privileged: $priv devices: $devs"
+    grep -qE 'docker\.sock|/var/lib/docker|/secrets|(^| )(/|/run|/var|/var/run|/var/lib|'"$repo"'):' <<< "$mounts" && bad+=" $svc:mount"
     [ "$capadd" = null ] || [ "$capadd" = "[]" ] || bad+=" $svc:cap_add"
+    [ "$priv" = false ] || bad+=" $svc:privileged"
+    [ "$devs" = null ] || [ "$devs" = "[]" ] || bad+=" $svc:devices"
   done
-  check K-6b "the Collectors mount no Docker socket, container logs or secrets, and add no capability (offenders:${bad:- none})" test -z "$bad"
+  check K-6b "the Collectors mount no Docker socket, container logs or secrets, are not privileged, and add no capability or device (offenders:${bad:- none})" test -z "$bad"
   # K-6c: each long-running container's cap_add is what the base file lists, and NET_RAW (bit 13)
   # is not in its bounding set, read from /proc/1/status through its pid namespace.
   bad="" n=0
@@ -950,35 +959,50 @@ section_k6() {
     c=$(dc ps -q "$svc" | head -1)
     [ -n "$c" ] || { bad+=" $svc:not-running"; continue; }
     n=$((n + 1))
-    capadd=$(docker inspect -f '{{json .HostConfig.CapAdd}}' "$c")
+    # Docker may or may not keep the CAP_ prefix, so both sides drop it before comparing.
+    capadd=$(docker inspect -f '{{json .HostConfig.CapAdd}}' "$c" | jq -c '(. // []) | map(ascii_upcase | ltrimstr("CAP_")) | sort')
+    want=$(jq -c --arg s "$svc" '(.services[$s].cap_add // []) | map(ascii_upcase | ltrimstr("CAP_")) | sort' <<< "$cfg")
     capbnd=$(docker run --rm --pid "container:$c" --network none --user 65532:65532 --read-only --cap-drop ALL "$bb" \
       sed -n 's/^CapBnd:[[:space:]]*//p' /proc/1/status 2> /dev/null)
-    echo "        $svc: cap_add $capadd, CapBnd ${capbnd:-unreadable}"
-    if [ -z "$capbnd" ] || (( (16#$capbnd >> 13) & 1 )); then bad+=" $svc"; fi
+    echo "        $svc: cap_add $capadd (base file $want), CapBnd ${capbnd:-unreadable}"
+    [ "$capadd" = "$want" ] || bad+=" $svc:cap_add"
+    if [ -z "$capbnd" ] || (( (16#$capbnd >> 13) & 1 )); then bad+=" $svc:NET_RAW"; fi
   done
-  check K-6c "NET_RAW is in no long-running container's bounding set ($n checked; offenders:${bad:- none})" test -z "$bad" -a "$n" -gt 0
+  check K-6c "each long-running container's cap_add is the base file's and NET_RAW is not in its bounding set ($n checked; offenders:${bad:- none})" test -z "$bad" -a "$n" -gt 0
 }
 
 # Q-1: the exit command. From a clean clone of this checkout (no ./secrets, ./generated or
 # pg/hba.d/*.conf) with the project's containers and volumes removed, every section in order.
 # The host's .env (git-ignored, no secrets: SETPIECE_PUBLISH_ADDRESS) is copied into the clone.
+# The clone lives at ./.spike-clean (git-ignored), and the stack keeps running from it afterwards,
+# so its bind mounts and secrets don't sit in a temp folder. The next `all` replaces it.
 section_all() {
-  local proj clone
+  local proj clone=$repo/.spike-clean fb rc
   if [ -z "${SPIKE_CLEAN:-}" ]; then
-    proj=${COMPOSE_PROJECT_NAME:-$(basename "$repo")}
-    clone=$(mktemp -d "${TMPDIR:-/tmp}/setpiece-clean.XXXXXX")
-    git clone -q "$repo" "$clone" && git -C "$clone" checkout -q "$(git -C "$repo" rev-parse HEAD)"
+    proj=${COMPOSE_PROJECT_NAME:-$(dc config --format json 2> /dev/null | jq -r '.name // empty')}
+    [ -n "$proj" ] || { fail Q-1 "could not read the Compose project name"; return; }
+    # Clone first, beside the old clone, so a failed clone leaves the running stack alone.
+    rm -rf -- "$clone.new"
+    if ! { git clone -q "$repo" "$clone.new" && git -C "$clone.new" checkout -q "$(git -C "$repo" rev-parse HEAD)"; }; then
+      fail Q-1 "clean clone of $repo failed; the stack was not touched"
+      rm -rf -- "$clone.new"
+      return
+    fi
+    docker compose -p "$proj" -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml" --profile "*" down -v --remove-orphans > /dev/null 2>&1
+    if ! { rm -rf -- "$clone" && mv -- "$clone.new" "$clone"; }; then
+      fail Q-1 "could not replace $clone with the new clone"
+      return
+    fi
     [ -f "$repo/.env" ] && cp "$repo/.env" "$clone/.env"
     echo "        clean clone: $clone at $(git -C "$clone" rev-parse --short HEAD), project $proj"
-    echo "        free -m before bring-up:"; free -m | awk '{ print "          " $0 }'
-    docker compose -p "$proj" -f "$repo/compose.base.yaml" -f "$repo/spike/compose.spike.yaml" --profile "*" down -v --remove-orphans > /dev/null 2>&1
     check A-1 "the project has no containers or volumes before bring-up" \
       test -z "$(docker ps -aq --filter "label=com.docker.compose.project=$proj")$(docker volume ls -q --filter "label=com.docker.compose.project=$proj")"
     check A-1 "the clone has no ./secrets, ./generated or pg/hba.d/*.conf" \
       bash -c '[ ! -e "$1/secrets" ] && [ ! -e "$1/generated" ] && ! compgen -G "$1/pg/hba.d/*.conf" > /dev/null' _ "$clone"
-    SPIKE_CLEAN=1 COMPOSE_PROJECT_NAME=$proj free_before=$(free -m) "$clone/scripts/spike-check" all
-    local rc=$?
-    echo "        the project now runs from $clone; to go back, run docker compose down -v and scripts/up in $repo"
+    fb=$(free -m)
+    SPIKE_CLEAN=1 COMPOSE_PROJECT_NAME=$proj free_before=$fb "$clone/scripts/spike-check" all
+    rc=$?
+    echo "        the project now runs from $clone"
     [ "$rc" -eq 0 ] || failed=1
     return
   fi
