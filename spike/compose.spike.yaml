@@ -51,3 +51,33 @@ services:
     <<: *target
     environment:
       TARGET_NAME: target-b
+
+  # One-shot: the K-3 database `spike`, its roles, the §4.2 tables, publication and grants.
+  # Run by spike-check k3 with `run --rm`; never by `up`.
+  spike-init:
+    image: postgres:18@sha256:c699303802144847d238196173655dbbecf7a96aeca1565f2b02eb671a1f0b6b
+    profiles: [spike-init]
+    entrypoint: ["/spike/spike-init.sh"]
+    user: postgres
+    secrets: [postgres-superuser, spike_owner, spike_cdc]
+    volumes:
+      - ./spike/spike-init.sh:/spike/spike-init.sh:ro
+      - ./spike/spike-roles.sql:/spike/spike-roles.sql:ro
+      - ./spike/spike-outbox.sql:/spike/spike-outbox.sql:ro
+    tmpfs: [/tmp]
+    networks: [services]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # Connect gets the K-3 connector's password file. Applying the overlay recreates connect;
+  # the next base-only scripts/up recreates it back (plan issue 8).
+  connect:
+    secrets: [kafka-connect, kafka-connect-producer, spike_cdc]
+
+secrets:
+  # Written by spike-check k3 into ./secrets, under the same rules as B-2.
+  spike_owner:
+    file: ./secrets/spike_owner
+  spike_cdc:
+    file: ./secrets/spike_cdc
