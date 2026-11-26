@@ -17,6 +17,18 @@ networks:
   # The Collectors, Kong's status listener and otel-lgtm.
   ops: {}
 
+# Container output goes to the OTel Collector through Docker's fluentd driver (§4.10; spec I-2).
+# Async and non-blocking with a buffer, so a container still starts while the Collector is down.
+# Every container uses it except the OTel Collector and otel-lgtm, which use `local`.
+x-logging: &logging
+  driver: fluentd
+  options:
+    fluentd-address: 127.0.0.1:24224
+    fluentd-async: "true"
+    mode: non-blocking
+    max-buffer-size: 4m
+    tag: "{{.Name}}"
+
 x-postgres-image: &postgres-image postgres:18@sha256:c699303802144847d238196173655dbbecf7a96aeca1565f2b02eb671a1f0b6b
 x-openfga-image: &openfga-image openfga/openfga:v1.23.0@sha256:2a1b4ef95f2f27e6d420f11cf14390b4f537e699de8d18b6a07d8b355e11cf02
 
@@ -46,6 +58,7 @@ services:
       - ./pg/hba.d:/etc/postgresql/hba.d:ro
     networks: [services, data, idp]
     cap_drop: [ALL]
+    logging: *logging
     # The entrypoint chowns the data directory and drops to the postgres user (§4.12b).
     cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
     restart: unless-stopped
@@ -68,6 +81,7 @@ services:
     tmpfs: [/tmp]
     networks: [services]
     cap_drop: [ALL]
+    logging: *logging
     # No capabilities: it only runs psql as the postgres user.
     cap_add: []
     depends_on:
@@ -83,6 +97,7 @@ services:
         target: /etc/openfga/config.yaml
     networks: [services]
     cap_drop: [ALL]
+    logging: *logging
     # No capabilities: a non-root (65532) Go binary.
     cap_add: []
     depends_on:
@@ -98,6 +113,7 @@ services:
         target: /etc/openfga/config.yaml
     networks: [services]
     cap_drop: [ALL]
+    logging: *logging
     # No capabilities: a non-root (65532) Go binary on unprivileged ports.
     cap_add: []
     restart: unless-stopped
@@ -140,6 +156,7 @@ services:
       - ./kong/kong.yaml:/kong/kong.yaml:ro
     # cap_add: none. Kong listens on 8443 inside the container, so it needs no NET_BIND_SERVICE.
     cap_drop: [ALL]
+    logging: *logging
     security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD", "kong", "health"]
@@ -160,6 +177,7 @@ services:
       - ./edge-auth/stub.mjs:/app/stub.mjs:ro
     # cap_add: none. It listens on 8080 as an unprivileged user.
     cap_drop: [ALL]
+    logging: *logging
     security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
@@ -168,6 +186,85 @@ services:
       retries: 6
       start_period: 5s
     networks: [services, idp]
+
+  # Receives OTLP and fluent-forward and sends to otel-lgtm (spec I-1). Its config file is
+  # its only mount. The image has no shell or HTTP client, so the health check runs the
+  # Collector's own binary (spec A-8): `validate` proves the binary runs and the config parses,
+  # not that pipelines are live; spike-check telemetry proves those.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.166.0@sha256:3e18fe04181de50bdd72e23ad4a4d6214b54351e63d496f1c58127cc4541ad7f
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    # cap_add: none
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    volumes:
+      - ./otel/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "127.0.0.1:24224:24224"
+    networks: [services, ops]
+    logging:
+      driver: local
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Host metrics as far as a container sees them: no host /proc, Docker socket, container logs
+  # or ./secrets, and a uid no other container uses (spec I-1).
+  otel-hostmetrics:
+    image: otel/opentelemetry-collector-contrib:0.166.0@sha256:3e18fe04181de50bdd72e23ad4a4d6214b54351e63d496f1c58127cc4541ad7f
+    user: "10101:10101"
+    read_only: true
+    cap_drop: [ALL]
+    # cap_add: none
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    volumes:
+      - ./otel/hostmetrics.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks: [ops]
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Grafana, Loki, Tempo and Prometheus in one container, behind the Collector (R-9; §4.9).
+  # Metrics kept 35 days, logs and traces 7 days, on a named volume (spec I-3). Grafana only on
+  # 127.0.0.1, anonymous login off, admin password from a secret file (spec I-4). Grafana applies
+  # the password only when it creates its database on the volume; to rotate it, reset the volume
+  # or run `grafana cli admin reset-admin-password` in the container.
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.41.1@sha256:1b852b77d7bcadb7699bfe7c78a51d059dff85168de674728cf7abf4474645e5
+    cap_drop: [ALL]
+    # cap_add: none
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    environment:
+      PROMETHEUS_EXTRA_ARGS: --storage.tsdb.retention.time=35d
+      LOKI_EXTRA_ARGS: -compactor.retention-enabled=true -compactor.delete-request-store=filesystem -store.retention=168h
+      TEMPO_EXTRA_ARGS: -backend-worker.compaction.block-retention=168h -backend-scheduler.provider.work.compaction.block-retention=168h
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_PASSWORD: $$__file{/run/secrets/grafana-admin}
+    secrets: [grafana-admin]
+    volumes:
+      - otel-lgtm-data:/data
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [ops]
+    logging:
+      driver: local
+    healthcheck:
+      test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   # Kafka, one combined KRaft node (§4.10; M0007; spec D-1). kafka/start.sh replaces the
   # image's command and reads the passwords from /run/secrets at run time.
@@ -183,6 +280,7 @@ services:
     networks: [services, data]
     restart: unless-stopped
     cap_drop: [ALL]
+    logging: *logging
     # cap_add: none. Runs as the image's appuser (uid 1000) and binds only 9092 and 9093.
     healthcheck:
       # A small heap for the check's own JVM, which would otherwise take the broker's 512 MB.
@@ -205,6 +303,7 @@ services:
       kafka:
         condition: service_healthy
     cap_drop: [ALL]
+    logging: *logging
     # cap_add: none. Runs as appuser and only opens client connections.
 
   # Kafka Connect with Debezium (§4.10; spec D-4). On data only: its REST API is
@@ -225,6 +324,7 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     cap_drop: [ALL]
+    logging: *logging
     # cap_add: none. Runs as the image's kafka user (uid 1001) and binds only 8083.
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8083/connectors"]
@@ -260,6 +360,7 @@ services:
     networks: [idp]
     # cap_add: none. Keycloak runs as uid 1000 and needs no capability.
     cap_drop: [ALL]
+    logging: *logging
     security_opt: ["no-new-privileges:true"]
     mem_limit: 1g
     restart: unless-stopped
@@ -278,6 +379,7 @@ services:
 
 volumes:
   postgres-data: {}
+  otel-lgtm-data: {}
   kafka-data: {}
 
 # Each container mounts only the files it declares (§4.12b). scripts/secrets-init writes them.
@@ -298,6 +400,8 @@ secrets:
     file: ./secrets/kong-tls.crt
   kong-tls.key:
     file: ./secrets/kong-tls.key
+  grafana-admin:
+    file: ./secrets/grafana-admin
   kafka-admin:
     file: ./secrets/kafka-admin
   kafka-connect:

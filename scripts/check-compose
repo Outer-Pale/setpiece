@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Static checks on the Compose files, run in CI (E03 plan issue 1; spec K-6d, K-6c, A-7, A-8, B-6).
+# Static checks on the Compose files, run in CI (E03 plan issue 1; spec K-6d, K-6c, A-7, A-8, B-6;
+# issue 7 adds I-2's logging block).
 # The checks against the running stack are spike-check's (issue OUT-155).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -9,6 +10,8 @@ trap 'rm -f "$out"' EXIT
 config=$(docker compose -f compose.base.yaml -f spike/compose.spike.yaml --profile "*" config --format json)
 long_running=$(sed -E 's/#.*//; s/[[:space:]]//g; /^$/d' platform/services.txt)
 
+# B-6 accepts a secret file's path, or, for Grafana's GF_* keys only, its $__file{} reference to one
+# ($$ is Compose's escape). No other product expands $__file{}.
 jq -r --arg lr "$long_running" '
   ($lr | split("\n") | map(select(length > 0))) as $long
   | .services // {} | to_entries[] | .key as $n | .value as $s
@@ -25,9 +28,25 @@ jq -r --arg lr "$long_running" '
       else empty end ),
     ( ($s.environment // {}) | to_entries[]
       | select(.key | test("PASSWORD|SECRET|TOKEN|KEY"; "i"))
-      | select((.value // "") | tostring | test("^/run/secrets/[A-Za-z0-9._-]+$") | not)
+      | select(.key as $k | (.value // "") | tostring
+               | (test("^/run/secrets/[A-Za-z0-9._-]+$")
+                  or (($k | startswith("GF_")) and test("^\\$\\$?__file\\{/run/secrets/[A-Za-z0-9._-]+\\}$")))
+               | not)
       | "\($n): \(.key) has a literal value in environment (B-6)" )
 ' <<< "$config" > "$out"
+
+# I-2: every base container except the OTel Collector and otel-lgtm logs through the fluentd driver
+# (§4.10). Base file only, every profile: the test overlay's one-shot probe keeps the default driver.
+# The OTel Collector and otel-lgtm stay on `local`: on fluentd the Collector would loop its own output.
+docker compose -f compose.base.yaml --profile "*" config --format json | jq -r '
+  .services // {} | to_entries[] | .key as $n | .value.logging as $l
+  | if ($n == "otel-collector" or $n == "otel-lgtm") then
+      (if $l.driver == "local" then empty else "\($n): must use the local log driver (I-1)" end)
+    elif ($l.driver == "fluentd" and $l.options["fluentd-address"] == "127.0.0.1:24224"
+        and $l.options["fluentd-async"] == "true" and $l.options.mode == "non-blocking"
+        and ($l.options["max-buffer-size"] // "") != "") then empty
+    else "\($n): not on the fluentd logging block (x-logging, I-2)" end
+' >> "$out"
 
 if [ -s "$out" ]; then
   cat "$out"

@@ -4,6 +4,9 @@ postgres
 openfga
 kong
 edge-auth
+otel-collector
+otel-hostmetrics
+otel-lgtm
 kafka
 connect
 keycloak

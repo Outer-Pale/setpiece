@@ -1,0 +1,26 @@
+# The host-metrics Collector (E03 spec I-1). It has no host /proc, Docker socket, container
+# logs or ./secrets, so it sees the host only as far as the kernel shows any container
+# (memory, load, CPU). It sends to the OTel Collector over ops.
+receivers:
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu: {}
+      load: {}
+      memory: {}
+
+processors:
+  batch: {}
+
+exporters:
+  otlp_grpc:
+    endpoint: otel-collector:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [hostmetrics]
+      processors: [batch]
+      exporters: [otlp_grpc]

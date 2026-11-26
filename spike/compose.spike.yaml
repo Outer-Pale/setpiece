@@ -10,6 +10,15 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     networks: [services]
+    # The base file's fluentd block (an anchor can't cross files), for the I-2 marker test.
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: 127.0.0.1:24224
+        fluentd-async: "true"
+        mode: non-blocking
+        max-buffer-size: 4m
+        tag: "{{.Name}}"
 
   # An HTTP and TLS client the checks attach to a network or another container's namespace
   # (K-4 on idp, K-6). One-shot: `docker compose ... run --rm probe <command>`.
