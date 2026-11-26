@@ -1,0 +1,16 @@
+# J-1: each compose.base.yaml container and its networks, from design checkpoint §4.12's table, for
+# the containers step 1 has. Kong joins idp for the sign-in routes; its status listener (ops) is off
+# in step 1, so it is not on ops yet. Keycloak is on idp only (spec reading note under K-4, P-6).
+connect          data
+edge-auth        idp services
+kafka            data services
+kafka-init       data
+keycloak         idp
+kong             edge idp services
+openfga          services
+openfga-migrate  services
+otel-collector   ops services
+otel-hostmetrics ops
+otel-lgtm        ops
+pg-init          services
+postgres         data idp services
