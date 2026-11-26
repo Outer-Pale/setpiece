@@ -367,6 +367,10 @@ k3_insert() {
       'user', 'sub-spike', '{\"client_id\": \"spike-client\"}')
     returning row_to_json(chassis_outbox)"
 }
+# Adds or removes connect-producer's write on the heartbeat topic ($@: --add, or --remove --force).
+k3_hb_acl() { dc exec -T kafka /opt/kafka/bin/kafka-acls.sh --bootstrap-server localhost:9092 \
+  --command-config /tmp/kafka/admin.properties "$@" --allow-principal User:connect-producer \
+  --operation Write --operation Describe --topic __debezium-heartbeat.cdc.spike > /dev/null 2>&1; }
 # Writes a K-3 password file into ./secrets if it is missing, under B-2's rules.
 spike_secret() {
   local f="$repo/secrets/$1" v
@@ -398,6 +402,11 @@ k3_run() {
     fail K-3 "fixture did not start: $(tail -3 "$d/init.log" "$d/c.log" | tr '\n' ' ')"; return
   fi
   for i in $(seq 60); do connect_api GET /connectors > /dev/null 2>&1 && break; sleep 3; done
+  # D-014 option (a): Debezium's heartbeat record is produced, so its offset commits and the slot
+  # moves. Its topic and connect-producer's write ACL stand in for what kafka-init would generate.
+  kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --create --if-not-exists \
+    --topic __debezium-heartbeat.cdc.spike --partitions 1 --replication-factor 1 > /dev/null 2>&1
+  k3_hb_acl --add
   connect_api PUT /connectors/spike/config --data-binary @- < "$repo/spike/connect-spike.json" > "$d/put.json"
   check K-3 "connector spike and its task RUNNING (heartbeat lowered to 10 s for the test)" wait_state "RUNNING RUNNING"
   kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --create --if-not-exists \
@@ -465,6 +474,7 @@ k3_run() {
   done
   psql_su "drop table if exists spike_wal" > /dev/null
   lsn_after "$lsn1" "$lsn2" || dc logs --since 5m connect 2>&1 | grep -iE 'warn|error|heartbeat|flush|lsn' | tail -25 | sed 's/^/        connect: /'
+  echo "        K-3c heartbeat topic end offset: $(end_offset __debezium-heartbeat.cdc.spike)"
   check K-3c "confirmed_flush_lsn of cdc_spike passed the WAL position after the last spike row within $((i * 5)) s, heartbeat 10 s ($lsn1 -> $lsn2)" \
     lsn_after "$lsn1" "$lsn2"
 
@@ -504,10 +514,16 @@ k3_cleanup() {
     [ -z "$(psql_su "select 1 from pg_replication_slots where slot_name = 'cdc_spike'")" ] && break
     sleep 2
   done
+  k3_hb_acl --remove --force
+  kafka_sh kafka-topics.sh --command-config /tmp/kafka/admin.properties --delete --if-exists \
+    --topic __debezium-heartbeat.cdc.spike > /dev/null 2>&1
   rm -f "$repo/pg/hba.d/spike.conf"; psql_su "select pg_reload_conf()" > /dev/null
   (cd "$repo" && scripts/up) > "$d/up2.log" 2>&1
   check K-3 "cleanup: no connector spike ($(connect_api GET /connectors 2> /dev/null))" \
     test "$(connect_api GET /connectors 2> /dev/null | jq -c 'index("spike")')" = null
+  check K-3 "cleanup: connect-producer's heartbeat ACL removed" \
+    test -z "$(dc exec -T kafka /opt/kafka/bin/kafka-acls.sh --bootstrap-server localhost:9092 \
+      --command-config /tmp/kafka/admin.properties --list --topic __debezium-heartbeat.cdc.spike 2> /dev/null | grep connect-producer)"
   check K-3 "cleanup: no replication slot cdc_spike" \
     test -z "$(psql_su "select 1 from pg_replication_slots where slot_name = 'cdc_spike'")"
   check K-3 "a base-only scripts/up afterwards brings connect back without the fixture secret" \

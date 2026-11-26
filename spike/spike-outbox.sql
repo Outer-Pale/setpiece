@@ -25,6 +25,9 @@ create table if not exists chassis_outbox (
 );
 create unique index if not exists chassis_outbox_version on chassis_outbox
   (ce_tenantid, aggregatetype, aggregateid, ce_aggregateversion) where kind = 'event';
+-- D-014 option (a), not yet in §4.2: InsertHeader cannot stamp the string 1.0, so the constant
+-- rides as a column placed as a header. `add column if not exists` keeps reruns repeatable.
+alter table chassis_outbox add column if not exists ce_specversion text not null default '1.0';
 create table if not exists chassis_heartbeat (id int primary key, at timestamptz not null);
 
 select 'create publication chassis_outbox_pub for table chassis_outbox, chassis_heartbeat with (publish = ''insert, update'')'
