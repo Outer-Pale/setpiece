@@ -2,7 +2,7 @@
 # Build step 1's checks (E03 spec, requirement Q-1). Each section prints
 # PASS, FAIL or NOT RUN per requirement id, with its evidence, and the script
 # exits non-zero if any check failed.
-# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg kafka k3 k4 k5 telemetry static net up-twice stats k6 all
+# Usage: scripts/spike-check <section>...   Sections: secrets up-version up-order static-config k1 k2 pg kafka k3 k4 k5 telemetry static net up-twice stats k6 all k1-sim
 #        scripts/spike-check k1 --from <label> <kong address> <this device's LAN address>   (K-1 (b), off the host)
 # Sections that need the running stack use the Compose project in COMPOSE_PROJECT_NAME, if set.
 # Functions are called indirectly through section_<name>, which shellcheck cannot see.
@@ -15,6 +15,8 @@ failed=0
 pass()   { printf 'PASS    %-5s %s\n' "$1" "$2"; }
 fail()   { printf 'FAIL    %-5s %s\n' "$1" "$2"; failed=1; }
 notrun() { printf 'NOT RUN %-5s %s\n' "$1" "$2"; }
+# Runs a check but only reports it: NOTE yes or NOTE no, and never sets the exit code.
+note()   { local id=$1 what=$2; shift 2; local r; if "$@"; then r=yes; else r=no; fi; printf 'NOTE    %-5s %s: %s\n' "$id" "$what" "$r"; }
 check()  { local id=$1 what=$2; shift 2; if "$@"; then pass "$id" "$what"; else fail "$id" "$what"; fi; }
 
 # A throwaway copy of the scripts and platform list, so checks never touch ./secrets.
@@ -283,6 +285,55 @@ k2_flip() {
 }
 # Both targets answer, nothing failed.
 k2_both='^a=[1-9][0-9]*\ b=[1-9][0-9]*\ 5xx=0\ other=0$'
+
+# K-1 (b), simulated on one host (G1 evidence pack). Not part of `all`, and never a stand-in for
+# `k1 --from` on two devices: it proves Kong's bucketing and the Docker NAT path on this host only.
+# Two long-lived clients send through each path: (1) on `edge`, straight to kong:8443, which tests
+# Kong alone and passes only if Kong sees each client's own address, the two get separate buckets,
+# and a forged X-Forwarded-For or X-Real-IP does not change the bucket; (2) on a throwaway network,
+# to the published 443 through its gateway address. Path 2 is hairpin traffic from the same host,
+# which docker-proxy may carry from one source address, so it is recorded as NOTE, never PASS or FAIL.
+section_k1_sim() {
+  local d img edge net gw a b n ip_a ip_b seen_a seen_b codes code mode url sim
+  d=$(mktemp -d)
+  if ! (cd "$repo" && scripts/up) > "$d/up.log" 2>&1 || ! dc up -d --wait echo > "$d/echo.log" 2>&1; then
+    fail K-1 "(b) sim: stack did not start: $(tail -3 "$d/up.log" "$d/echo.log" | tr '\n' ' ')"
+    rm -rf "$d"; return
+  fi
+  img=$(dc --profile probe config --format json | jq -r '.services.probe.image')
+  edge=$(dc config --format json | jq -r '.networks.edge.name')
+  net="k1sim-$$"
+  docker network create "$net" > /dev/null
+  gw=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$net")
+  for mode in edge published; do
+    if [ "$mode" = edge ]; then url=https://kong:8443; n=$edge; else url=https://$gw:443; n=$net; fi
+    a=$(docker run -d --rm --network "$n" --user 65532 --cap-drop ALL --entrypoint sleep "$img" 600)
+    b=$(docker run -d --rm --network "$n" --user 65532 --cap-drop ALL --entrypoint sleep "$img" 600)
+    ip_a=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$n\").IPAddress}}" "$a")
+    ip_b=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$n\").IPAddress}}" "$b")
+    req() { docker exec "$1" curl -sk -m 5 "${@:2}"; }
+    seen_a=$(req "$a" "$url/spike/k1" -H 'Authorization: Bearer good-sim-a' | jq -r '.headers["x-real-ip"] // empty')
+    seen_b=$(req "$b" "$url/spike/k1" -H 'Authorization: Bearer good-sim-b' | jq -r '.headers["x-real-ip"] // empty')
+    echo "        $mode: client A $ip_a, Kong saw ${seen_a:-nothing}; client B $ip_b, Kong saw ${seen_b:-nothing}"
+    # On the hairpin path only record what happens (see the header).
+    if [ "$mode" = edge ]; then sim=check; else sim=note; fi
+    $sim K-1 "(b) sim $mode: Kong sees each client's own address" test "$seen_a" = "$ip_a" -a "$seen_b" = "$ip_b"
+    fresh_minute
+    codes=""
+    for _ in 1 2 3 4; do
+      codes+="$(req "$a" -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H 'Authorization: Bearer good-sim-a') "
+    done
+    $sim K-1 "(b) sim $mode: client A gets 3 then 429 (limit 3 a minute; got $codes)" test "$codes" = "200 200 200 429 "
+    code=$(req "$a" -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H 'Authorization: Bearer good-sim-a' \
+      -H "X-Forwarded-For: ${seen_b:-$ip_b}" -H "X-Real-IP: ${seen_b:-$ip_b}")
+    $sim K-1 "(b) sim $mode: A forging B's address in X-Forwarded-For and X-Real-IP is still limited (HTTP $code)" test "$code" = 429
+    code=$(req "$b" -o /dev/null -w '%{http_code}' "$url/spike/k1-limit" -H 'Authorization: Bearer good-sim-b')
+    $sim K-1 "(b) sim $mode: client B has its own bucket (HTTP $code)" test "$code" = 200
+    docker rm -f "$a" "$b" > /dev/null
+  done
+  docker network rm "$net" > /dev/null
+  rm -rf "$d"
+}
 
 section_k2() {
   local d addr url seen i
