@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Static checks on the Compose files, run in CI (E03 plan issue 1; spec K-6d, K-6c, A-7, A-8, B-6;
-# issue 7 adds I-2's logging block).
+# issue 7 adds I-2's logging block; A-4 so that A-7 and A-8 reach every long-running container).
 # The checks against the running stack are spike-check's (issue OUT-155).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -47,6 +47,15 @@ docker compose -f compose.base.yaml --profile "*" config --format json | jq -r '
         and ($l.options["max-buffer-size"] // "") != "") then empty
     else "\($n): not on the fluentd logging block (x-logging, I-2)" end
 ' >> "$out"
+
+# A-4: platform/services.txt is the base file's services minus its one-shots. A-7 and A-8 above
+# check only the listed containers, so without this an unlisted long-running container with no
+# restart policy or health check would pass. spike-check static checks the same on the stack.
+want=$(docker compose -f compose.base.yaml --profile "*" config --services |
+  { grep -vxF -f <(sed -E 's/#.*//; s/[[:space:]]//g; /^$/d' spike/expected/one-shots.txt) || true; } | sort)
+{ diff <(printf '%s\n' "$want") <(sort <<< "$long_running") || true; } |
+  sed -nE 's/^< (.+)/\1: long-running but not in platform\/services.txt (A-4)/p
+    s/^> (.+)/\1: in platform\/services.txt but not a long-running base service (A-4)/p' >> "$out"
 
 if [ -s "$out" ]; then
   cat "$out"
